@@ -35,8 +35,11 @@ The subject backend plugin protocol is defined in the Animus core repo:
 
 - **Protocol design:** [`docs/architecture/subject-backend-plugins.md`](https://github.com/launchapp-dev/animus-cli/blob/main/docs/architecture/subject-backend-plugins.md)
 - **Naming contract:** [`docs/architecture/naming-contract.md`](https://github.com/launchapp-dev/animus-cli/blob/main/docs/architecture/naming-contract.md)
-- **Crate name:** `ao-subject-linear` (this repo, the `ao-*` protocol prefix per the naming contract)
-- **Repository name:** `animus-subject-linear` (this repo, the brand prefix for discovery)
+- **Repository name:** `animus-subject-linear`
+- **Crate name (published to crates.io):** `animus-subject-linear`
+- **Binary name:** `animus-subject-linear`
+
+Per the v0.4.0 naming convention: repo, crate, and binary all share the same `animus-{kind}-{name}` name. There is no longer an `ao-` prefix anywhere.
 
 ## Roadmap
 
