@@ -1,0 +1,54 @@
+{
+  "data": {
+    "issues": {
+      "pageInfo": { "hasNextPage": false, "endCursor": null },
+      "nodes": [
+        {
+          "id": "11111111-1111-4111-8111-111111111111",
+          "identifier": "ENG-1",
+          "title": "Investigate flaky test",
+          "description": "The webhook integration test fails ~10% of the time.",
+          "priority": 3,
+          "url": "https://linear.app/launchapp/issue/ENG-1",
+          "createdAt": "2026-05-01T10:00:00.000Z",
+          "updatedAt": "2026-05-15T14:32:00.000Z",
+          "state": { "id": "state-todo", "name": "Todo", "type": "unstarted" },
+          "assignee": { "id": "user-1", "name": "Alice Example", "email": "alice@example.com" },
+          "labels": { "nodes": [{ "name": "backend" }, { "name": "testing" }] },
+          "parent": null,
+          "children": { "nodes": [] }
+        },
+        {
+          "id": "22222222-2222-4222-8222-222222222222",
+          "identifier": "ENG-2",
+          "title": "Ship dark mode",
+          "description": null,
+          "priority": 2,
+          "url": "https://linear.app/launchapp/issue/ENG-2",
+          "createdAt": "2026-05-02T11:00:00.000Z",
+          "updatedAt": "2026-05-16T09:00:00.000Z",
+          "state": { "id": "state-progress", "name": "In Progress", "type": "started" },
+          "assignee": null,
+          "labels": { "nodes": [{ "name": "ui" }] },
+          "parent": { "identifier": "ENG-100" },
+          "children": { "nodes": [] }
+        },
+        {
+          "id": "33333333-3333-4333-8333-333333333333",
+          "identifier": "ENG-3",
+          "title": "Wrap up Q2 retro",
+          "description": "",
+          "priority": 1,
+          "url": "https://linear.app/launchapp/issue/ENG-3",
+          "createdAt": "2026-04-20T15:00:00.000Z",
+          "updatedAt": "2026-05-14T18:00:00.000Z",
+          "state": { "id": "state-done", "name": "Done", "type": "completed" },
+          "assignee": { "id": "user-2", "name": "Bob Example", "email": "bob@example.com" },
+          "labels": { "nodes": [] },
+          "parent": null,
+          "children": { "nodes": [{ "identifier": "ENG-4" }, { "identifier": "ENG-5" }] }
+        }
+      ]
+    }
+  }
+}

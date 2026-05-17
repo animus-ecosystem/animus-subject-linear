@@ -1,0 +1,22 @@
+{
+  "data": {
+    "issueUpdate": {
+      "success": true,
+      "issue": {
+        "id": "11111111-1111-4111-8111-111111111111",
+        "identifier": "ENG-1",
+        "title": "Investigate flaky test",
+        "description": "The webhook integration test fails ~10% of the time.",
+        "priority": 3,
+        "url": "https://linear.app/launchapp/issue/ENG-1",
+        "createdAt": "2026-05-01T10:00:00.000Z",
+        "updatedAt": "2026-05-17T16:00:00.000Z",
+        "state": { "id": "state-progress", "name": "In Progress", "type": "started" },
+        "assignee": { "id": "user-2", "name": "Bob Example", "email": "bob@example.com" },
+        "labels": { "nodes": [{ "name": "backend" }, { "name": "testing" }, { "name": "wip" }] },
+        "parent": null,
+        "children": { "nodes": [] }
+      }
+    }
+  }
+}

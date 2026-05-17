@@ -1,0 +1,13 @@
+schema = "animus.plugin.v1"
+name = "animus-subject-linear"
+version = "0.1.0"
+plugin_kind = "subject_backend"
+description = "Linear subject backend for Animus"
+
+[capabilities]
+streaming = false
+progress = false
+cancellation = false
+
+[binary]
+default = "animus-subject-linear"
