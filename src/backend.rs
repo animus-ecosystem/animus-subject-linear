@@ -24,6 +24,17 @@ use crate::status_map;
 const ID_PREFIX: &str = "linear:";
 const SUBJECT_KIND: &str = "issue";
 
+/// Error message returned when an authenticated method is called without
+/// `LINEAR_API_TOKEN` being set.
+const MISSING_TOKEN_MSG: &str = "LINEAR_API_TOKEN required";
+
+/// Last-error string surfaced by `health()` when the token is missing.
+const HEALTH_MISSING_TOKEN: &str = "LINEAR_API_TOKEN unset";
+
+fn missing_token_error() -> BackendError {
+    BackendError::Other(anyhow::anyhow!(MISSING_TOKEN_MSG))
+}
+
 /// GraphQL fields we read on every issue. Centralized so `list`, `get`, and
 /// `update` all return the same shape.
 const ISSUE_FIELDS: &str = r#"
@@ -351,6 +362,9 @@ impl LinearBackend {
 #[async_trait]
 impl SubjectBackend for LinearBackend {
     async fn list(&self, filter: SubjectFilter) -> Result<SubjectList, BackendError> {
+        if !self.client.has_token() {
+            return Err(missing_token_error());
+        }
         let issue_filter = self.build_issue_filter(&filter);
         let limit = filter.limit.unwrap_or(50).clamp(1, 100) as i64;
         let variables = json!({
@@ -404,6 +418,9 @@ impl SubjectBackend for LinearBackend {
 
     async fn get(&self, id: &SubjectId) -> Result<Subject, BackendError> {
         let native = Self::native_id(id)?;
+        if !self.client.has_token() {
+            return Err(missing_token_error());
+        }
         let variables = json!({ "id": native });
 
         let response = self
@@ -423,6 +440,9 @@ impl SubjectBackend for LinearBackend {
 
     async fn update(&self, id: &SubjectId, patch: SubjectPatch) -> Result<Subject, BackendError> {
         let native = Self::native_id(id)?;
+        if !self.client.has_token() {
+            return Err(missing_token_error());
+        }
         let input = Self::build_update_input(&patch)?;
         let variables = json!({ "id": native, "input": input });
 
@@ -518,6 +538,15 @@ impl SubjectBackend for LinearBackend {
     }
 
     async fn health(&self) -> Result<HealthCheckResult, BackendError> {
+        if !self.client.has_token() {
+            return Ok(HealthCheckResult {
+                status: HealthStatus::Unhealthy,
+                uptime_ms: None,
+                memory_usage_bytes: None,
+                last_error: Some(HEALTH_MISSING_TOKEN.to_string()),
+            });
+        }
+
         let response = self
             .client
             .execute("query AnimusHealth { viewer { id name } }", json!({}))

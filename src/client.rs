@@ -73,18 +73,28 @@ pub struct LinearClient {
     http: Client,
     api_url: String,
     team_id: Option<String>,
+    has_token: bool,
 }
 
 impl LinearClient {
     /// Construct a client from configuration. Builds the underlying reqwest
     /// client with the `Authorization` header pre-set so individual call sites
     /// don't have to remember to attach it.
+    ///
+    /// If `config.api_token` is `None`, the client is built without an
+    /// `Authorization` header. Network methods that require auth must check
+    /// [`Self::has_token`] before issuing a request.
     pub fn new(config: &LinearConfig) -> Result<Self> {
         let mut headers = HeaderMap::new();
-        let mut auth = HeaderValue::from_str(&config.api_token)
-            .context("LINEAR_API_TOKEN contains characters that aren't valid in a header")?;
-        auth.set_sensitive(true);
-        headers.insert(AUTHORIZATION, auth);
+        let has_token = if let Some(token) = config.api_token.as_deref() {
+            let mut auth = HeaderValue::from_str(token)
+                .context("LINEAR_API_TOKEN contains characters that aren't valid in a header")?;
+            auth.set_sensitive(true);
+            headers.insert(AUTHORIZATION, auth);
+            true
+        } else {
+            false
+        };
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
 
         let http = Client::builder()
@@ -98,12 +108,18 @@ impl LinearClient {
             http,
             api_url: config.api_url.clone(),
             team_id: config.team_id.clone(),
+            has_token,
         })
     }
 
     /// Team scope for `list` queries, if configured.
     pub fn team_id(&self) -> Option<&str> {
         self.team_id.as_deref()
+    }
+
+    /// Whether a `LINEAR_API_TOKEN` was present at construction.
+    pub fn has_token(&self) -> bool {
+        self.has_token
     }
 
     /// POST a raw GraphQL query string + variables and return the parsed

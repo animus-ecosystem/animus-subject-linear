@@ -26,6 +26,11 @@ fn backend_against(url: &str) -> LinearBackend {
     LinearBackend::new(config).expect("backend should build")
 }
 
+fn backend_without_token(url: &str) -> LinearBackend {
+    let config = LinearConfig::without_token(url, Some("ENG".to_string()));
+    LinearBackend::new(config).expect("token-less backend should still build")
+}
+
 #[tokio::test]
 async fn list_returns_mapped_subjects() {
     let mut server = Server::new_async().await;
@@ -371,4 +376,78 @@ async fn list_returns_next_cursor_when_paginating() {
         .expect("list ok");
     assert_eq!(page.next_cursor.as_deref(), Some("cursor-page-2"));
     let _placeholder: Option<Subject> = page.subjects.into_iter().next();
+}
+
+/// Regression for the `--manifest` bug: building a backend without a
+/// `LINEAR_API_TOKEN` must succeed. The CLI runtime parses `--manifest`
+/// before any backend method is invoked, so config + construction need to
+/// be credential-free.
+#[tokio::test]
+async fn backend_builds_without_token() {
+    let server = Server::new_async().await;
+    let backend = backend_without_token(&server.url());
+    // Schema is a static description - no credentials needed.
+    let schema = backend.schema();
+    assert_eq!(schema.kinds, vec!["issue".to_string()]);
+}
+
+/// `health()` must NOT hit the network when there's no token; it should
+/// return `Unhealthy` with a clear reason so `animus plugin list` can still
+/// surface the plugin in catalog output.
+#[tokio::test]
+async fn health_is_unhealthy_without_token() {
+    let server = Server::new_async().await;
+    let backend = backend_without_token(&server.url());
+    let health = backend.health().await.expect("health should not error");
+    assert_eq!(health.status, HealthStatus::Unhealthy);
+    let msg = health.last_error.expect("missing-token should explain why");
+    assert!(
+        msg.contains("LINEAR_API_TOKEN"),
+        "error should mention env var: {msg}"
+    );
+    assert!(msg.contains("unset"), "error should say `unset`: {msg}");
+}
+
+/// Authenticated methods must reject calls cleanly when the token is missing,
+/// using `BackendError::Other` carrying "LINEAR_API_TOKEN required".
+#[tokio::test]
+async fn list_get_update_require_token() {
+    let server = Server::new_async().await;
+    let backend = backend_without_token(&server.url());
+
+    let list_err = backend
+        .list(SubjectFilter::default())
+        .await
+        .expect_err("list should error without token");
+    match list_err {
+        BackendError::Other(e) => assert!(
+            e.to_string().contains("LINEAR_API_TOKEN required"),
+            "list err: {e}"
+        ),
+        other => panic!("expected BackendError::Other, got {other:?}"),
+    }
+
+    let get_err = backend
+        .get(&SubjectId::new("linear:ENG-1"))
+        .await
+        .expect_err("get should error without token");
+    match get_err {
+        BackendError::Other(e) => assert!(
+            e.to_string().contains("LINEAR_API_TOKEN required"),
+            "get err: {e}"
+        ),
+        other => panic!("expected BackendError::Other, got {other:?}"),
+    }
+
+    let update_err = backend
+        .update(&SubjectId::new("linear:ENG-1"), SubjectPatch::default())
+        .await
+        .expect_err("update should error without token");
+    match update_err {
+        BackendError::Other(e) => assert!(
+            e.to_string().contains("LINEAR_API_TOKEN required"),
+            "update err: {e}"
+        ),
+        other => panic!("expected BackendError::Other, got {other:?}"),
+    }
 }
