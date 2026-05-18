@@ -7,6 +7,7 @@ on:
 
 permissions:
   contents: write
+  id-token: write
 
 jobs:
   build:
@@ -82,6 +83,21 @@ jobs:
           mkdir -p release
           find dist -type f \( -name "animus-subject-linear-*.tar.gz" -o -name "animus-subject-linear-*.tar.gz.sha256" \) -exec cp {} release/ \;
           ls -la release
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3.7.0
+
+      - name: Sign archives with cosign (keyless)
+        run: |
+          set -euo pipefail
+          cd release
+          for ARCHIVE in animus-subject-linear-*.tar.gz; do
+            cosign sign-blob \
+              --yes \
+              --bundle "${ARCHIVE}.bundle" \
+              "${ARCHIVE}"
+          done
+          ls -la
 
       - name: Create GitHub release
         uses: softprops/action-gh-release@v2
