@@ -372,6 +372,9 @@ impl LinearBackend {
             created_at,
             updated_at,
             custom,
+            native_status: None,
+            status_metadata: Value::Null,
+            attachments: Vec::new(),
         })
     }
 
@@ -580,6 +583,7 @@ impl SubjectBackend for LinearBackend {
                 .iter()
                 .map(|s| s.to_string())
                 .collect(),
+            status_dispatch_hints: Vec::new(),
             custom_fields: vec![
                 CustomFieldSpec {
                     key: "priority".to_string(),

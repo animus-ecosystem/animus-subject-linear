@@ -1,6 +1,6 @@
 [package]
 name = "animus-subject-linear"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 license = "MIT"
 description = "Linear (linear.app) subject backend plugin for Animus"
@@ -18,9 +18,9 @@ name = "animus-subject-linear"
 path = "src/main.rs"
 
 [dependencies]
-animus-plugin-protocol  = { git = "https://github.com/launchapp-dev/animus-protocol", tag = "v0.1.0" }
-animus-subject-protocol = { git = "https://github.com/launchapp-dev/animus-protocol", tag = "v0.1.0" }
-animus-plugin-runtime   = { git = "https://github.com/launchapp-dev/animus-protocol", tag = "v0.1.0" }
+animus-plugin-protocol  = { git = "https://github.com/launchapp-dev/animus-protocol", tag = "v0.1.2" }
+animus-subject-protocol = { git = "https://github.com/launchapp-dev/animus-protocol", tag = "v0.1.2" }
+animus-plugin-runtime   = { git = "https://github.com/launchapp-dev/animus-protocol", tag = "v0.1.2" }
 
 reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
 serde = { version = "1", features = ["derive"] }
