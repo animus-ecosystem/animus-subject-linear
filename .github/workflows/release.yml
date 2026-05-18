@@ -50,17 +50,20 @@ jobs:
         if: '!matrix.cross'
         run: cargo build --release --target ${{ matrix.target }}
 
-      - name: Stage artifact
+      - name: Package archive
         run: |
+          set -euo pipefail
           mkdir -p dist
-          cp target/${{ matrix.target }}/release/animus-subject-linear dist/animus-subject-linear-${{ matrix.target }}
-          chmod +x dist/animus-subject-linear-${{ matrix.target }}
+          BIN=animus-subject-linear
+          ARCHIVE="${BIN}-${{ matrix.target }}.tar.gz"
+          tar -C target/${{ matrix.target }}/release -czf "dist/${ARCHIVE}" "${BIN}"
+          ( cd dist && shasum -a 256 "${ARCHIVE}" > "${ARCHIVE}.sha256" )
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: animus-subject-linear-${{ matrix.target }}
-          path: dist/animus-subject-linear-${{ matrix.target }}
+          path: dist/animus-subject-linear-${{ matrix.target }}.tar.gz*
 
   release:
     name: Publish GitHub release
@@ -77,7 +80,7 @@ jobs:
       - name: Flatten artifacts
         run: |
           mkdir -p release
-          find dist -type f -name "animus-subject-linear-*" -exec cp {} release/ \;
+          find dist -type f \( -name "animus-subject-linear-*.tar.gz" -o -name "animus-subject-linear-*.tar.gz.sha256" \) -exec cp {} release/ \;
           ls -la release
 
       - name: Create GitHub release
