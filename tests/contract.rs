@@ -3,7 +3,13 @@
 //! Each test stands up a mockito GraphQL server, points `LinearBackend` at it,
 //! and exercises one trait method end-to-end. Fixtures live in
 //! `tests/fixtures/` so the assertions stay focused on mapping logic.
+//!
+//! Most tests now also mock Linear's `team.states.nodes` query — the backend
+//! lazily fetches the team's workflow states on the first call that needs
+//! status translation, then caches the result.
 
+use std::collections::HashMap;
+use std::sync::Arc;
 use std::sync::Mutex;
 
 use animus_plugin_protocol::HealthStatus;
@@ -31,11 +37,37 @@ fn backend_without_token(url: &str) -> LinearBackend {
     LinearBackend::new(config).expect("token-less backend should still build")
 }
 
+fn backend_with_overrides(url: &str, overrides: HashMap<String, SubjectStatus>) -> LinearBackend {
+    let config = LinearConfig::new("test-token", url, Some("ENG".to_string()))
+        .with_status_overrides(overrides);
+    LinearBackend::new(config).expect("backend should build")
+}
+
+/// Discriminates GraphQL POST bodies by the operation name embedded in
+/// the `query` string. mockito's `match_body` accepts a closure-based
+/// matcher we can wire to inspect the request body.
+fn matches_operation(operation: &'static str) -> Matcher {
+    Matcher::Regex(format!(r#"query\s+{operation}\b"#))
+}
+
+fn matches_mutation(operation: &'static str) -> Matcher {
+    Matcher::Regex(format!(r#"mutation\s+{operation}\b"#))
+}
+
 #[tokio::test]
 async fn list_returns_mapped_subjects() {
     let mut server = Server::new_async().await;
-    let _m = server
+    let _team_states = server
         .mock("POST", "/")
+        .match_body(matches_operation("AnimusTeamStates"))
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(fixture("team_states_default.json"))
+        .create_async()
+        .await;
+    let _issues = server
+        .mock("POST", "/")
+        .match_body(matches_operation("AnimusListIssues"))
         .match_header("authorization", "test-token")
         .match_header("content-type", "application/json")
         .with_status(200)
@@ -100,8 +132,17 @@ async fn list_returns_mapped_subjects() {
 #[tokio::test]
 async fn get_returns_subject_by_id() {
     let mut server = Server::new_async().await;
-    let _m = server
+    let _team_states = server
         .mock("POST", "/")
+        .match_body(matches_operation("AnimusTeamStates"))
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(fixture("team_states_default.json"))
+        .create_async()
+        .await;
+    let _issue = server
+        .mock("POST", "/")
+        .match_body(matches_operation("AnimusGetIssue"))
         .with_status(200)
         .with_header("content-type", "application/json")
         .with_body(fixture("get_one_issue.json"))
@@ -148,6 +189,15 @@ async fn get_rejects_non_linear_id() {
 async fn update_translates_patch() {
     let mut server = Server::new_async().await;
 
+    let _team_states = server
+        .mock("POST", "/")
+        .match_body(matches_operation("AnimusTeamStates"))
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(fixture("team_states_default.json"))
+        .create_async()
+        .await;
+
     // Capture the request body so we can assert the GraphQL variables shape.
     let captured: std::sync::Arc<Mutex<Option<serde_json::Value>>> =
         std::sync::Arc::new(Mutex::new(None));
@@ -155,16 +205,7 @@ async fn update_translates_patch() {
 
     let _m = server
         .mock("POST", "/")
-        .match_body(Matcher::PartialJson(serde_json::json!({
-            "variables": {
-                "id": "ENG-1",
-                "input": {
-                    "stateName": "In Progress",
-                    "labelIds": { "add": ["wip"], "remove": ["needs-triage"] },
-                    "assigneeId": "bob@example.com"
-                }
-            }
-        })))
+        .match_body(matches_mutation("AnimusUpdateIssue"))
         .with_status(200)
         .with_header("content-type", "application/json")
         .with_body_from_request(move |req| {
@@ -202,9 +243,15 @@ async fn update_translates_patch() {
     let variables = body.get("variables").expect("body has variables");
     assert_eq!(variables.get("id").and_then(|v| v.as_str()), Some("ENG-1"));
     let input = variables.get("input").expect("variables has input");
+    // Regression: update must send `stateId` (UUID), NOT `stateName`.
+    assert!(
+        input.get("stateName").is_none(),
+        "update must not emit stateName: {input}"
+    );
     assert_eq!(
-        input.get("stateName").and_then(|v| v.as_str()),
-        Some("In Progress")
+        input.get("stateId").and_then(|v| v.as_str()),
+        Some("state-progress"),
+        "update must emit stateId from the team's workflow"
     );
     assert_eq!(
         input.get("assigneeId").and_then(|v| v.as_str()),
@@ -230,11 +277,20 @@ async fn update_translates_patch() {
 #[tokio::test]
 async fn update_clear_assignee_serializes_null() {
     let mut server = Server::new_async().await;
+    let _team_states = server
+        .mock("POST", "/")
+        .match_body(matches_operation("AnimusTeamStates"))
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(fixture("team_states_default.json"))
+        .create_async()
+        .await;
     let captured: std::sync::Arc<Mutex<Option<serde_json::Value>>> =
         std::sync::Arc::new(Mutex::new(None));
     let captured_clone = captured.clone();
     let _m = server
         .mock("POST", "/")
+        .match_body(matches_mutation("AnimusUpdateIssue"))
         .with_status(200)
         .with_header("content-type", "application/json")
         .with_body_from_request(move |req| {
@@ -333,8 +389,17 @@ async fn schema_returns_expected_shape() {
 #[tokio::test]
 async fn list_propagates_graphql_errors() {
     let mut server = Server::new_async().await;
+    let _team_states = server
+        .mock("POST", "/")
+        .match_body(matches_operation("AnimusTeamStates"))
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(fixture("team_states_default.json"))
+        .create_async()
+        .await;
     let _m = server
         .mock("POST", "/")
+        .match_body(matches_operation("AnimusListIssues"))
         .with_status(200)
         .with_header("content-type", "application/json")
         .with_body(r#"{ "errors": [{ "message": "Internal server error" }] }"#)
@@ -352,6 +417,14 @@ async fn list_propagates_graphql_errors() {
 #[tokio::test]
 async fn list_returns_next_cursor_when_paginating() {
     let mut server = Server::new_async().await;
+    let _team_states = server
+        .mock("POST", "/")
+        .match_body(matches_operation("AnimusTeamStates"))
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(fixture("team_states_default.json"))
+        .create_async()
+        .await;
     let body = serde_json::json!({
         "data": {
             "issues": {
@@ -363,6 +436,7 @@ async fn list_returns_next_cursor_when_paginating() {
     .to_string();
     let _m = server
         .mock("POST", "/")
+        .match_body(matches_operation("AnimusListIssues"))
         .with_status(200)
         .with_header("content-type", "application/json")
         .with_body(body)
@@ -450,4 +524,281 @@ async fn list_get_update_require_token() {
         ),
         other => panic!("expected BackendError::Other, got {other:?}"),
     }
+}
+
+// =====================================================================
+// Status map: runtime discovery + override regression tests
+// =====================================================================
+
+/// On the first call that needs status translation, the backend must query
+/// `team.states.nodes` and populate the in-process cache. Subsequent calls
+/// must reuse the cached map without re-querying.
+#[tokio::test]
+async fn fetches_workflow_states_on_first_call_and_caches() {
+    let mut server = Server::new_async().await;
+    // Expect the workflow-states query EXACTLY ONCE. mockito's
+    // `expect(1)` would fail the assertion if it's not called once.
+    let team_states_mock = server
+        .mock("POST", "/")
+        .match_body(matches_operation("AnimusTeamStates"))
+        .expect(1)
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(fixture("team_states_default.json"))
+        .create_async()
+        .await;
+    let _issue = server
+        .mock("POST", "/")
+        .match_body(matches_operation("AnimusGetIssue"))
+        .expect(2)
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(fixture("get_one_issue.json"))
+        .create_async()
+        .await;
+
+    let backend = backend_against(&server.url());
+
+    // First call — should drive the workflow-states fetch.
+    backend
+        .get(&SubjectId::new("linear:ENG-1"))
+        .await
+        .expect("first get");
+    // Second call — must NOT re-fetch workflow states.
+    backend
+        .get(&SubjectId::new("linear:ENG-1"))
+        .await
+        .expect("second get");
+
+    team_states_mock.assert_async().await;
+}
+
+/// `LINEAR_STATUS_MAP` overrides must beat the type-based auto-map.
+#[tokio::test]
+async fn applies_user_override_from_env() {
+    let mut server = Server::new_async().await;
+    let _team_states = server
+        .mock("POST", "/")
+        .match_body(matches_operation("AnimusTeamStates"))
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(fixture("team_states_custom.json"))
+        .create_async()
+        .await;
+
+    let captured: Arc<Mutex<Option<serde_json::Value>>> = Arc::new(Mutex::new(None));
+    let captured_clone = captured.clone();
+    let _update = server
+        .mock("POST", "/")
+        .match_body(matches_mutation("AnimusUpdateIssue"))
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body_from_request(move |req| {
+            let body = req.body().expect("body");
+            let parsed: serde_json::Value = serde_json::from_slice(body).unwrap_or_default();
+            *captured_clone.lock().unwrap() = Some(parsed);
+            fixture("update_issue_ok.json").into_bytes()
+        })
+        .create_async()
+        .await;
+
+    // Override "Spec" to InProgress instead of the default Ready.
+    let mut overrides = HashMap::new();
+    overrides.insert("Spec".to_string(), SubjectStatus::InProgress);
+    let backend = backend_with_overrides(&server.url(), overrides);
+
+    let patch = SubjectPatch {
+        status: Some(SubjectStatus::InProgress),
+        ..Default::default()
+    };
+    backend
+        .update(&SubjectId::new("linear:ENG-1"), patch)
+        .await
+        .expect("update ok");
+
+    // With Spec overridden to InProgress AND it being position 1 (lower
+    // than uuid-impl's position 2), the override-winning state should be
+    // the reverse lookup target.
+    let body = captured
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("server captured the body");
+    let state_id = body
+        .pointer("/variables/input/stateId")
+        .and_then(|v| v.as_str())
+        .expect("stateId in input");
+    assert_eq!(
+        state_id, "uuid-spec",
+        "override-winning Spec (position 1) must be picked over Implementation (position 2)"
+    );
+}
+
+/// When multiple Linear states map to the same animus status, the reverse
+/// lookup must pick the lowest-position state (Linear's default "first"
+/// state for that category).
+#[tokio::test]
+async fn update_resolves_ambiguous_status_by_lowest_position() {
+    let mut server = Server::new_async().await;
+    let _team_states = server
+        .mock("POST", "/")
+        .match_body(matches_operation("AnimusTeamStates"))
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        // team_states_ambiguous has TWO Ready candidates: Backlog (pos 5.0)
+        // and Todo (pos 1.0). Todo must win.
+        .with_body(fixture("team_states_ambiguous.json"))
+        .create_async()
+        .await;
+
+    let captured: Arc<Mutex<Option<serde_json::Value>>> = Arc::new(Mutex::new(None));
+    let captured_clone = captured.clone();
+    let _update = server
+        .mock("POST", "/")
+        .match_body(matches_mutation("AnimusUpdateIssue"))
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body_from_request(move |req| {
+            let body = req.body().expect("body");
+            let parsed: serde_json::Value = serde_json::from_slice(body).unwrap_or_default();
+            *captured_clone.lock().unwrap() = Some(parsed);
+            fixture("update_issue_ok.json").into_bytes()
+        })
+        .create_async()
+        .await;
+
+    let backend = backend_against(&server.url());
+    let patch = SubjectPatch {
+        status: Some(SubjectStatus::Ready),
+        ..Default::default()
+    };
+    backend
+        .update(&SubjectId::new("linear:ENG-1"), patch)
+        .await
+        .expect("update ok");
+
+    let body = captured
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("server captured the body");
+    let state_id = body
+        .pointer("/variables/input/stateId")
+        .and_then(|v| v.as_str())
+        .expect("stateId");
+    assert_eq!(
+        state_id, "uuid-todo",
+        "lowest-position Ready candidate (Todo, pos 1.0) must win over Backlog (pos 5.0)"
+    );
+}
+
+/// When the team's workflow has no state mapping to the requested animus
+/// status, `update()` must return `InvalidRequest` with a message pointing
+/// the user at `LINEAR_STATUS_MAP`.
+#[tokio::test]
+async fn update_errors_clearly_when_no_state_maps_to_target() {
+    let mut server = Server::new_async().await;
+    // Workflow with no `cancelled` state.
+    let body = serde_json::json!({
+        "data": {
+            "team": {
+                "states": {
+                    "nodes": [
+                        { "id": "uuid-todo", "name": "Todo", "type": "unstarted", "position": 1.0 },
+                        { "id": "uuid-prog", "name": "In Progress", "type": "started", "position": 2.0 },
+                        { "id": "uuid-done", "name": "Done", "type": "completed", "position": 3.0 }
+                    ]
+                }
+            }
+        }
+    });
+    let _team_states = server
+        .mock("POST", "/")
+        .match_body(matches_operation("AnimusTeamStates"))
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(body.to_string())
+        .create_async()
+        .await;
+
+    let backend = backend_against(&server.url());
+    let patch = SubjectPatch {
+        status: Some(SubjectStatus::Cancelled),
+        ..Default::default()
+    };
+    let err = backend
+        .update(&SubjectId::new("linear:ENG-1"), patch)
+        .await
+        .expect_err("update must error when no state maps to Cancelled");
+    match err {
+        BackendError::InvalidRequest(msg) => {
+            assert!(
+                msg.contains("Cancelled"),
+                "error should name the unmapped status: {msg}"
+            );
+            assert!(
+                msg.contains("LINEAR_STATUS_MAP"),
+                "error should mention the override env var: {msg}"
+            );
+        }
+        other => panic!("expected InvalidRequest, got {other:?}"),
+    }
+}
+
+/// Regression: the outgoing GraphQL mutation must send `stateId` (Linear's
+/// canonical UUID) — never `stateName`.
+#[tokio::test]
+async fn update_sends_state_id_not_state_name() {
+    let mut server = Server::new_async().await;
+    let _team_states = server
+        .mock("POST", "/")
+        .match_body(matches_operation("AnimusTeamStates"))
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(fixture("team_states_default.json"))
+        .create_async()
+        .await;
+
+    let captured: Arc<Mutex<Option<serde_json::Value>>> = Arc::new(Mutex::new(None));
+    let captured_clone = captured.clone();
+    let _update = server
+        .mock("POST", "/")
+        .match_body(matches_mutation("AnimusUpdateIssue"))
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body_from_request(move |req| {
+            let body = req.body().expect("body");
+            let parsed: serde_json::Value = serde_json::from_slice(body).unwrap_or_default();
+            *captured_clone.lock().unwrap() = Some(parsed);
+            fixture("update_issue_ok.json").into_bytes()
+        })
+        .create_async()
+        .await;
+
+    let backend = backend_against(&server.url());
+    let patch = SubjectPatch {
+        status: Some(SubjectStatus::Done),
+        ..Default::default()
+    };
+    backend
+        .update(&SubjectId::new("linear:ENG-1"), patch)
+        .await
+        .expect("update ok");
+
+    let body = captured
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("server captured the body");
+    let input = body.pointer("/variables/input").expect("has input");
+    assert!(
+        input.get("stateName").is_none(),
+        "must NOT emit stateName: {input}"
+    );
+    let state_id = input
+        .get("stateId")
+        .and_then(|v| v.as_str())
+        .expect("must emit stateId");
+    // team_states_default's Done is state-done.
+    assert_eq!(state_id, "state-done");
 }

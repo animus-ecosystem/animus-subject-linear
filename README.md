@@ -29,6 +29,68 @@ workflows:
     phases: [...]
 ```
 
+## Configuring status mapping
+
+Linear lets every team customize the names of their workflow states (e.g.
+`"Spec"`, `"Implementation"`, `"Code Review"`, `"Shipped"`), so a hardcoded
+name map only works for teams using Linear's default template. Instead, the
+plugin discovers the team's actual workflow at startup and auto-maps each
+state to one of the Animus statuses (`Ready`, `InProgress`, `Blocked`,
+`Done`, `Cancelled`).
+
+### Auto-mapping (default)
+
+On the first `list`/`get`/`update` call the plugin queries Linear's
+`team.states.nodes { id name type position }` and uses the **`type`**
+field to map every state. The `type` is fixed by Linear regardless of
+what the team renames the state to:
+
+| Linear `WorkflowState.type`                | Animus `SubjectStatus` |
+|--------------------------------------------|------------------------|
+| `triage`, `backlog`, `unstarted`           | `Ready`                |
+| `started`                                  | `InProgress`           |
+| `completed`                                | `Done`                 |
+| `cancelled`                                | `Cancelled`            |
+
+Unknown future types default to `Ready` so a Linear-side addition won't
+freeze your dispatch loop.
+
+### Overrides via `LINEAR_STATUS_MAP`
+
+If your team uses semantics that don't match the type-based mapping
+(for example, you want `"Code Review"` to count as `Done` rather than
+`InProgress`), set the `LINEAR_STATUS_MAP` env var to a JSON object
+keyed by Linear state **name** (case-sensitive):
+
+```bash
+export LINEAR_STATUS_MAP='{
+  "Spec":         "Ready",
+  "Implementation": "InProgress",
+  "Code Review":  "InProgress",
+  "Shipped":      "Done"
+}'
+```
+
+Values must be one of `Ready`, `InProgress`, `Blocked`, `Done`,
+`Cancelled` (PascalCase or kebab-case both accepted). Unknown values
+are silently skipped — the rest of the map still applies. A malformed
+JSON blob falls back to the type-based auto-map and logs a warning.
+
+### Ambiguity resolution on the write path
+
+If multiple Linear states map to the same animus status (e.g. both
+`"Spec"` and `"Backlog"` map to `Ready`), `update()` picks the one with
+the **lowest `position`** — Linear's default "first" state for that
+category. This keeps writes deterministic without forcing you to
+disambiguate in `LINEAR_STATUS_MAP`.
+
+### Why `stateId` and not `stateName`?
+
+The Linear API takes a `stateId` (UUID) on `issueUpdate(input: { stateId })`.
+Sending a name string is tolerated but not the documented shape and breaks
+if two teams have a state with the same name. This plugin always sends
+the UUID it discovered for the team in question.
+
 ## Design
 
 The subject backend plugin protocol is defined in the Animus core repo:

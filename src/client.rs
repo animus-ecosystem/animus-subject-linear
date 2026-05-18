@@ -21,6 +21,23 @@ use std::time::Duration;
 
 use crate::config::LinearConfig;
 
+/// One row of Linear's `team.states.nodes`. Returned by
+/// [`LinearClient::fetch_workflow_states`] and consumed by
+/// [`crate::status_map::StatusMap::from_workflow_states`].
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+pub struct LinearWorkflowState {
+    /// Linear's UUID for the state (what `issueUpdate(input: { stateId })` wants).
+    pub id: String,
+    /// Display name the team gave the state ("Spec", "In Progress", ...).
+    pub name: String,
+    /// Stable category from Linear's enum: `triage`, `backlog`, `unstarted`,
+    /// `started`, `completed`, `cancelled`. Robust to user-driven renames.
+    #[serde(rename = "type")]
+    pub state_type: String,
+    /// Order Linear uses to sort the workflow column UI; lower is "earlier".
+    pub position: f64,
+}
+
 /// HTTP timeout for individual GraphQL requests.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -120,6 +137,36 @@ impl LinearClient {
     /// Whether a `LINEAR_API_TOKEN` was present at construction.
     pub fn has_token(&self) -> bool {
         self.has_token
+    }
+
+    /// Fetch the workflow states for a Linear team. Used at backend init
+    /// (lazily on first dispatch call) to build a [`crate::status_map::StatusMap`].
+    ///
+    /// The query uses Linear's `team(id: $teamId) { states { nodes { ... } } }`
+    /// path. A missing team or auth failure surfaces as an error.
+    pub async fn fetch_workflow_states(&self, team_id: &str) -> Result<Vec<LinearWorkflowState>> {
+        const QUERY: &str = r#"
+            query AnimusTeamStates($teamId: String!) {
+              team(id: $teamId) {
+                states {
+                  nodes { id name type position }
+                }
+              }
+            }
+        "#;
+
+        let response = self
+            .execute(QUERY, json!({ "teamId": team_id }))
+            .await
+            .context("linear workflow states query failed")?;
+
+        let data = response.into_data()?;
+        let nodes = data
+            .pointer("/team/states/nodes")
+            .ok_or_else(|| anyhow!("linear response missing team.states.nodes"))?;
+        let parsed: Vec<LinearWorkflowState> = serde_json::from_value(nodes.clone())
+            .context("could not deserialize team.states.nodes as workflow states")?;
+        Ok(parsed)
     }
 
     /// POST a raw GraphQL query string + variables and return the parsed

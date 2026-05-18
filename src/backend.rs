@@ -6,6 +6,7 @@
 //! prefix.
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use animus_plugin_protocol::{HealthCheckResult, HealthStatus};
 use animus_subject_protocol::{
@@ -16,10 +17,11 @@ use animus_subject_protocol::{
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde_json::{json, Value};
+use tokio::sync::OnceCell;
 
 use crate::client::LinearClient;
 use crate::config::LinearConfig;
-use crate::status_map;
+use crate::status_map::{self, StatusMap};
 
 const ID_PREFIX: &str = "linear:";
 const SUBJECT_KIND: &str = "issue";
@@ -57,6 +59,11 @@ children(first: 50) { nodes { identifier } }
 #[derive(Debug, Clone)]
 pub struct LinearBackend {
     client: LinearClient,
+    config: LinearConfig,
+    /// Lazily populated on the first call that needs status translation.
+    /// `Arc` so the backend stays `Clone` (the plugin host clones it across
+    /// inbound dispatch calls) while sharing the single discovered map.
+    status_map: Arc<OnceCell<StatusMap>>,
 }
 
 impl LinearBackend {
@@ -64,7 +71,43 @@ impl LinearBackend {
     /// header-safe (but does NOT perform a network call - that's `health()`).
     pub fn new(config: LinearConfig) -> anyhow::Result<Self> {
         let client = LinearClient::new(&config)?;
-        Ok(Self { client })
+        Ok(Self {
+            client,
+            config,
+            status_map: Arc::new(OnceCell::new()),
+        })
+    }
+
+    /// Returns the cached [`StatusMap`], discovering it from Linear on the
+    /// first call. Subsequent calls return the cached value without
+    /// re-querying.
+    ///
+    /// Requires `team_id` to be configured (the workflow states query is
+    /// scoped to a team).
+    async fn status_map(&self) -> Result<&StatusMap, BackendError> {
+        if !self.client.has_token() {
+            return Err(missing_token_error());
+        }
+        let team_id = self.client.team_id().ok_or_else(|| {
+            BackendError::InvalidRequest(
+                "LINEAR_TEAM_ID must be set to discover workflow states for status mapping"
+                    .to_string(),
+            )
+        })?;
+
+        self.status_map
+            .get_or_try_init(|| async {
+                let states = self
+                    .client
+                    .fetch_workflow_states(team_id)
+                    .await
+                    .map_err(|e| BackendError::Unavailable(e.to_string()))?;
+                Ok::<StatusMap, BackendError>(StatusMap::from_workflow_states(
+                    &states,
+                    &self.config.status_overrides,
+                ))
+            })
+            .await
     }
 
     /// Translate a `linear:ENG-123`-style [`SubjectId`] into the bare
@@ -125,7 +168,7 @@ impl LinearBackend {
     }
 
     /// Build the `IssueFilter` GraphQL variable from a [`SubjectFilter`].
-    fn build_issue_filter(&self, filter: &SubjectFilter) -> Value {
+    fn build_issue_filter(&self, filter: &SubjectFilter, status_map: &StatusMap) -> Value {
         let mut graphql_filter = serde_json::Map::new();
 
         if let Some(team_id) = self.client.team_id() {
@@ -133,15 +176,18 @@ impl LinearBackend {
         }
 
         if !filter.status.is_empty() {
-            let native_names: Vec<String> = filter
-                .status
+            // Map each requested animus status to all Linear state UUIDs
+            // that resolve to it. We filter by stateId rather than name
+            // because names can collide across teams and stateId is the
+            // canonical key.
+            let state_ids: Vec<String> = status_map
                 .iter()
-                .map(|s| status_map::animus_to_linear(*s).to_string())
+                .filter(|(_, _, animus_status)| filter.status.contains(animus_status))
+                .map(|(id, _, _)| id.to_string())
                 .collect();
-            graphql_filter.insert(
-                "state".to_string(),
-                json!({ "name": { "in": native_names } }),
-            );
+            if !state_ids.is_empty() {
+                graphql_filter.insert("state".to_string(), json!({ "id": { "in": state_ids } }));
+            }
         }
 
         if !filter.assignee.is_empty() {
@@ -178,7 +224,7 @@ impl LinearBackend {
     }
 
     /// Translate a GraphQL `Issue` node into a normalized [`Subject`].
-    fn issue_to_subject(issue: &Value) -> Result<Subject, BackendError> {
+    fn issue_to_subject(issue: &Value, status_map: &StatusMap) -> Result<Subject, BackendError> {
         let identifier = issue
             .get("identifier")
             .and_then(|v| v.as_str())
@@ -200,12 +246,28 @@ impl LinearBackend {
             .filter(|s| !s.is_empty())
             .map(str::to_string);
 
+        // Prefer the state UUID for translation (stable, override-aware).
+        // Fall back to the state name, then to the type-based default if
+        // the team's workflow changed between discovery and this read.
+        let state_id = issue
+            .get("state")
+            .and_then(|s| s.get("id"))
+            .and_then(|v| v.as_str());
         let state_name = issue
             .get("state")
             .and_then(|s| s.get("name"))
             .and_then(|v| v.as_str())
             .unwrap_or("");
-        let status = status_map::linear_to_animus(state_name);
+        let state_type = issue
+            .get("state")
+            .and_then(|s| s.get("type"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+
+        let status = state_id
+            .and_then(|id| status_map.linear_to_animus(id))
+            .or_else(|| status_map.linear_name_to_animus(state_name))
+            .unwrap_or_else(|| status_map::type_to_animus(state_type));
 
         let priority = issue
             .get("priority")
@@ -315,13 +377,15 @@ impl LinearBackend {
 
     /// Build the `IssueUpdateInput` for a [`SubjectPatch`].
     ///
-    /// Note: applying `status` translates to a Linear `stateId`, which would
-    /// require us to first look up the team's workflow states to find the
-    /// matching id. For v0.1.0 we forward a `stateName` hint through the
-    /// `customStateName` mutation extension - if no extension is available the
-    /// daemon will degrade gracefully via the `BackendError::InvalidRequest`
-    /// path in `apply_patch_unsupported_status_change`.
-    fn build_update_input(patch: &SubjectPatch) -> Result<Value, BackendError> {
+    /// `status` translates to a Linear `stateId` (UUID) — the canonical key
+    /// `issueUpdate(input: { stateId })` expects. The UUID comes from
+    /// [`StatusMap::animus_to_linear_state_id`]. If no state in the team's
+    /// workflow maps to the requested animus status, we return
+    /// [`BackendError::InvalidRequest`] with a hint about [`crate::config::ENV_STATUS_MAP`].
+    fn build_update_input(
+        patch: &SubjectPatch,
+        status_map: &StatusMap,
+    ) -> Result<Value, BackendError> {
         let mut input = serde_json::Map::new();
 
         if let Some(Some(assignee)) = &patch.assignee {
@@ -349,10 +413,12 @@ impl LinearBackend {
         }
 
         if let Some(status) = patch.status {
-            input.insert(
-                "stateName".to_string(),
-                Value::String(status_map::animus_to_linear(status).to_string()),
-            );
+            let state_id = status_map.animus_to_linear_state_id(status).ok_or_else(|| {
+                BackendError::InvalidRequest(format!(
+                    "no Linear workflow state maps to animus status {status:?}; configure LINEAR_STATUS_MAP env var to override"
+                ))
+            })?;
+            input.insert("stateId".to_string(), Value::String(state_id.to_string()));
         }
 
         Ok(Value::Object(input))
@@ -365,7 +431,8 @@ impl SubjectBackend for LinearBackend {
         if !self.client.has_token() {
             return Err(missing_token_error());
         }
-        let issue_filter = self.build_issue_filter(&filter);
+        let status_map = self.status_map().await?;
+        let issue_filter = self.build_issue_filter(&filter, status_map);
         let limit = filter.limit.unwrap_or(50).clamp(1, 100) as i64;
         let variables = json!({
             "filter": issue_filter,
@@ -392,7 +459,7 @@ impl SubjectBackend for LinearBackend {
 
         let mut subjects = Vec::with_capacity(nodes.len());
         for node in nodes {
-            subjects.push(Self::issue_to_subject(node)?);
+            subjects.push(Self::issue_to_subject(node, status_map)?);
         }
 
         let next_cursor = issues_root.get("pageInfo").and_then(|p| {
@@ -421,6 +488,7 @@ impl SubjectBackend for LinearBackend {
         if !self.client.has_token() {
             return Err(missing_token_error());
         }
+        let status_map = self.status_map().await?;
         let variables = json!({ "id": native });
 
         let response = self
@@ -435,7 +503,7 @@ impl SubjectBackend for LinearBackend {
             .filter(|v| !v.is_null())
             .ok_or_else(|| BackendError::NotFound(id.to_string()))?;
 
-        Self::issue_to_subject(issue)
+        Self::issue_to_subject(issue, status_map)
     }
 
     async fn update(&self, id: &SubjectId, patch: SubjectPatch) -> Result<Subject, BackendError> {
@@ -443,7 +511,8 @@ impl SubjectBackend for LinearBackend {
         if !self.client.has_token() {
             return Err(missing_token_error());
         }
-        let input = Self::build_update_input(&patch)?;
+        let status_map = self.status_map().await?;
+        let input = Self::build_update_input(&patch, status_map)?;
         let variables = json!({ "id": native, "input": input });
 
         let response = self
@@ -473,7 +542,7 @@ impl SubjectBackend for LinearBackend {
             .filter(|v| !v.is_null())
             .ok_or_else(|| BackendError::NotFound(id.to_string()))?;
 
-        Self::issue_to_subject(issue)
+        Self::issue_to_subject(issue, status_map)
     }
 
     async fn watch(&self) -> Option<EventStream> {
@@ -501,7 +570,13 @@ impl SubjectBackend for LinearBackend {
             supports_watch: false,
             supports_create: false,
             supports_pagination: true,
-            native_status_values: status_map::KNOWN_NATIVE_STATUSES
+            // `schema()` is sync; runtime discovery from Linear is async.
+            // Surface a sensible static fallback that lists the well-known
+            // Linear-default state names. If a workflow author needs the
+            // team's actual states, they can call `list/get/update` once
+            // (which populates the runtime-discovered map) and read the
+            // names from issue.custom["linear_state_name"].
+            native_status_values: status_map::FALLBACK_NATIVE_STATUSES
                 .iter()
                 .map(|s| s.to_string())
                 .collect(),

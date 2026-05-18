@@ -8,6 +8,9 @@
 //! the environment. The token is validated at the point of use inside
 //! [`crate::backend::LinearBackend`]'s `list`/`get`/`update` methods.
 
+use std::collections::HashMap;
+
+use animus_subject_protocol::SubjectStatus;
 use anyhow::Result;
 
 /// Default Linear GraphQL endpoint.
@@ -22,6 +25,19 @@ pub const ENV_TEAM_ID: &str = "LINEAR_TEAM_ID";
 /// Environment variable overriding the GraphQL endpoint (used by tests + self-hosted Linear).
 pub const ENV_API_URL: &str = "LINEAR_API_URL";
 
+/// Environment variable holding a JSON object that overrides the type-based
+/// auto-map for specific Linear state names. Example:
+///
+/// ```text
+/// LINEAR_STATUS_MAP='{"Spec":"Ready","Implementation":"InProgress","Shipped":"Done"}'
+/// ```
+///
+/// Keys are matched against `WorkflowState.name` (case-sensitive). Values must
+/// be one of `Ready`, `InProgress`, `Blocked`, `Done`, `Cancelled`. Unknown
+/// values are silently ignored (the rest of the map still applies); a malformed
+/// JSON blob also falls back to the empty map rather than crashing the plugin.
+pub const ENV_STATUS_MAP: &str = "LINEAR_STATUS_MAP";
+
 /// Runtime configuration for the Linear backend plugin.
 #[derive(Debug, Clone)]
 pub struct LinearConfig {
@@ -35,6 +51,11 @@ pub struct LinearConfig {
     pub api_url: String,
     /// Optional team identifier; when set, `list` queries are constrained to this team.
     pub team_id: Option<String>,
+    /// User-supplied overrides for the status auto-map. See [`ENV_STATUS_MAP`].
+    /// Keys are Linear `WorkflowState.name` strings (case-sensitive); values
+    /// are the normalized [`SubjectStatus`] they should map to. Empty by
+    /// default — the type-based auto-map handles every state on its own.
+    pub status_overrides: HashMap<String, SubjectStatus>,
 }
 
 impl LinearConfig {
@@ -48,10 +69,16 @@ impl LinearConfig {
         let api_url =
             std::env::var(ENV_API_URL).unwrap_or_else(|_| DEFAULT_LINEAR_API_URL.to_string());
         let team_id = std::env::var(ENV_TEAM_ID).ok().filter(|s| !s.is_empty());
+        let status_overrides = std::env::var(ENV_STATUS_MAP)
+            .ok()
+            .filter(|s| !s.is_empty())
+            .map(|raw| parse_status_overrides(&raw))
+            .unwrap_or_default();
         Ok(Self {
             api_token,
             api_url,
             team_id,
+            status_overrides,
         })
     }
 
@@ -66,6 +93,7 @@ impl LinearConfig {
             api_token: Some(api_token.into()),
             api_url: api_url.into(),
             team_id,
+            status_overrides: HashMap::new(),
         }
     }
 
@@ -76,7 +104,79 @@ impl LinearConfig {
             api_token: None,
             api_url: api_url.into(),
             team_id,
+            status_overrides: HashMap::new(),
         }
+    }
+
+    /// In-memory builder that also threads through a [`status_overrides`](Self::status_overrides)
+    /// map. Mirrors what [`Self::from_env`] would build from [`ENV_STATUS_MAP`].
+    pub fn with_status_overrides(mut self, overrides: HashMap<String, SubjectStatus>) -> Self {
+        self.status_overrides = overrides;
+        self
+    }
+}
+
+/// Parse a JSON blob into a name -> [`SubjectStatus`] map. Malformed JSON or
+/// values outside the supported [`SubjectStatus`] variants are silently
+/// dropped (returning an empty map for a fully-invalid blob); we'd rather
+/// the plugin keep running with the type-based auto-map than crash on a
+/// typo in the env var.
+fn parse_status_overrides(raw: &str) -> HashMap<String, SubjectStatus> {
+    let parsed: serde_json::Map<String, serde_json::Value> = match serde_json::from_str(raw) {
+        Ok(map) => map,
+        Err(err) => {
+            tracing::warn!(
+                target: "animus_subject_linear",
+                ?err,
+                "ignoring malformed LINEAR_STATUS_MAP env var"
+            );
+            return HashMap::new();
+        }
+    };
+
+    let mut out = HashMap::with_capacity(parsed.len());
+    for (name, value) in parsed {
+        let status_str = match value.as_str() {
+            Some(s) => s,
+            None => {
+                tracing::warn!(
+                    target: "animus_subject_linear",
+                    state = %name,
+                    value = %value,
+                    "LINEAR_STATUS_MAP entry must be a string; skipping"
+                );
+                continue;
+            }
+        };
+        let status = match parse_subject_status(status_str) {
+            Some(s) => s,
+            None => {
+                tracing::warn!(
+                    target: "animus_subject_linear",
+                    state = %name,
+                    value = %status_str,
+                    "LINEAR_STATUS_MAP value is not a known SubjectStatus; skipping"
+                );
+                continue;
+            }
+        };
+        out.insert(name, status);
+    }
+    out
+}
+
+/// Map the PascalCase variant names (`"Ready"`, `"InProgress"`, ...) used in
+/// `LINEAR_STATUS_MAP` to [`SubjectStatus`]. Also accepts the kebab-case
+/// serde form (`"in-progress"`) for users who write the map as JSON output
+/// from another tool.
+fn parse_subject_status(raw: &str) -> Option<SubjectStatus> {
+    match raw {
+        "Ready" | "ready" => Some(SubjectStatus::Ready),
+        "InProgress" | "in-progress" | "in_progress" => Some(SubjectStatus::InProgress),
+        "Blocked" | "blocked" => Some(SubjectStatus::Blocked),
+        "Done" | "done" => Some(SubjectStatus::Done),
+        "Cancelled" | "cancelled" | "Canceled" | "canceled" => Some(SubjectStatus::Cancelled),
+        _ => None,
     }
 }
 
@@ -110,10 +210,12 @@ mod tests {
         let saved_token = std::env::var(ENV_API_TOKEN).ok();
         let saved_url = std::env::var(ENV_API_URL).ok();
         let saved_team = std::env::var(ENV_TEAM_ID).ok();
+        let saved_status_map = std::env::var(ENV_STATUS_MAP).ok();
 
         std::env::remove_var(ENV_API_TOKEN);
         std::env::remove_var(ENV_API_URL);
         std::env::remove_var(ENV_TEAM_ID);
+        std::env::remove_var(ENV_STATUS_MAP);
 
         let cfg = LinearConfig::from_env().expect("from_env must be lenient about missing token");
         assert!(
@@ -122,6 +224,7 @@ mod tests {
         );
         assert_eq!(cfg.api_url, DEFAULT_LINEAR_API_URL);
         assert!(cfg.team_id.is_none());
+        assert!(cfg.status_overrides.is_empty());
 
         if let Some(v) = saved_token {
             std::env::set_var(ENV_API_TOKEN, v);
@@ -132,5 +235,38 @@ mod tests {
         if let Some(v) = saved_team {
             std::env::set_var(ENV_TEAM_ID, v);
         }
+        if let Some(v) = saved_status_map {
+            std::env::set_var(ENV_STATUS_MAP, v);
+        }
+    }
+
+    #[test]
+    fn parse_status_overrides_handles_valid_json() {
+        let raw = r#"{"Spec":"Ready","Implementation":"InProgress","Shipped":"Done"}"#;
+        let parsed = parse_status_overrides(raw);
+        assert_eq!(parsed.len(), 3);
+        assert_eq!(parsed.get("Spec"), Some(&SubjectStatus::Ready));
+        assert_eq!(
+            parsed.get("Implementation"),
+            Some(&SubjectStatus::InProgress)
+        );
+        assert_eq!(parsed.get("Shipped"), Some(&SubjectStatus::Done));
+    }
+
+    #[test]
+    fn parse_status_overrides_ignores_unknown_values() {
+        let raw = r#"{"Spec":"NotAStatus","Implementation":"InProgress"}"#;
+        let parsed = parse_status_overrides(raw);
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(
+            parsed.get("Implementation"),
+            Some(&SubjectStatus::InProgress)
+        );
+    }
+
+    #[test]
+    fn parse_status_overrides_returns_empty_for_malformed_json() {
+        assert!(parse_status_overrides("not json at all").is_empty());
+        assert!(parse_status_overrides("[1,2,3]").is_empty());
     }
 }

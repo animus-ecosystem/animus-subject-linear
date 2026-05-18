@@ -1,0 +1,15 @@
+{
+  "data": {
+    "team": {
+      "states": {
+        "nodes": [
+          { "id": "uuid-spec", "name": "Spec", "type": "backlog", "position": 1.0 },
+          { "id": "uuid-impl", "name": "Implementation", "type": "started", "position": 2.0 },
+          { "id": "uuid-review", "name": "Code Review", "type": "started", "position": 3.0 },
+          { "id": "uuid-shipped", "name": "Shipped", "type": "completed", "position": 4.0 },
+          { "id": "uuid-wont", "name": "Won't Do", "type": "cancelled", "position": 5.0 }
+        ]
+      }
+    }
+  }
+}

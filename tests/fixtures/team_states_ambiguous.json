@@ -1,0 +1,14 @@
+{
+  "data": {
+    "team": {
+      "states": {
+        "nodes": [
+          { "id": "uuid-backlog", "name": "Backlog", "type": "backlog", "position": 5.0 },
+          { "id": "uuid-todo", "name": "Todo", "type": "unstarted", "position": 1.0 },
+          { "id": "uuid-progress", "name": "In Progress", "type": "started", "position": 2.0 },
+          { "id": "uuid-done", "name": "Done", "type": "completed", "position": 3.0 }
+        ]
+      }
+    }
+  }
+}
