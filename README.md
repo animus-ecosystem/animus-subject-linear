@@ -2,19 +2,38 @@
 
 A [Linear](https://linear.app) subject backend plugin for [Animus](https://github.com/launchapp-dev/animus-cli).
 
-> **Status:** Under construction — landing in Animus v0.4.0.
-
 ## What this is
 
-Animus v0.4.0 makes subjects (units of dispatchable work) pluggable. This repository will ship `ao-subject-linear`, a standalone stdio plugin that exposes Linear issues as Animus subjects. Workflows dispatch agents over your Linear backlog without your team moving off Linear.
+Animus v0.4.0+ makes subjects (units of dispatchable work) pluggable. This repository ships `animus-subject-linear`, a standalone stdio plugin that exposes Linear issues as Animus subjects. Workflows dispatch agents over your Linear backlog without your team moving off Linear.
 
-Once published, you'll be able to:
+## Install
+
+```bash
+animus plugin install launchapp-dev/animus-subject-linear
+export LINEAR_API_TOKEN=lin_api_…
+export LINEAR_TEAM_ID=<your-team-uuid>   # required for status discovery + scoped queries
+```
+
+## Subject kind
+
+This backend advertises a single subject kind: **`issue`**. Animus addresses it via the kind-scoped routing contract — `issue/list`, `issue/get`, `issue/update`. CLI calls use `--kind issue`:
+
+```bash
+animus subject list --kind issue --status ready
+animus subject get  --kind issue --id linear:ENG-123
+animus subject update --kind issue --id linear:ENG-123 --status in-progress \
+    --comment "kicked off implementation"
+```
+
+Subject ids are namespaced as `linear:<identifier>` (e.g. `linear:ENG-123`) so the daemon can route writes back to this backend from the id prefix alone.
+
+## Workflow YAML example
 
 ```yaml
-# .ao/workflows/standard.yaml
+# .animus/workflows/standard.yaml
 subjects:
   linear-eng:
-    plugin: ao-subject-linear
+    plugin: animus-subject-linear
     config:
       api_token_env: LINEAR_API_TOKEN
       team: ENG
@@ -25,9 +44,21 @@ subjects:
 
 workflows:
   - id: linear-impl
-    subject_type: linear-eng
+    subject_kind: issue
     phases: [...]
 ```
+
+## Supported operations
+
+| Method            | Backed by                          | Notes                                                                                                                                       |
+|-------------------|------------------------------------|---------------------------------------------------------------------------------------------------------------------------------------------|
+| `subject/list`    | `issues(filter, first, after)`     | Pagination cursor returned in `next_cursor`.                                                                                                |
+| `subject/get`     | `issue(id: $identifier)`           | `id` argument is the Linear identifier (e.g. `ENG-123`) or UUID.                                                                            |
+| `subject/update`  | `issueUpdate` + `commentCreate`    | `patch.status`, `patch.assignee`, `patch.labels_add/remove`, `patch.custom` ride on `issueUpdate`. `patch.comment` posts a real Linear comment via `commentCreate` — it does **not** overwrite the issue body. |
+| `subject/schema`  | static + runtime workflow states   | `kinds: ["issue"]`; native states discovered lazily from the team's workflow.                                                               |
+| `health/check`    | `viewer { id name }`               | Returns `Unhealthy` (without hitting the network) when `LINEAR_API_TOKEN` is unset.                                                          |
+
+The protocol does not yet expose a `subject/create` verb — see [`docs/architecture/subject-backend-plugins.md`](https://github.com/launchapp-dev/animus-cli/blob/main/docs/architecture/subject-backend-plugins.md) for the current contract. The schema's `supports_create` flag is reserved for the protocol expansion that adds it.
 
 ## Configuring status mapping
 
@@ -105,15 +136,16 @@ Per the v0.4.0 naming convention: repo, crate, and binary all share the same `an
 
 ## Roadmap
 
-- [ ] `SubjectBackend` trait implementation against Linear's GraphQL API
-- [ ] Status mapping configurable via workflow YAML
-- [ ] Authentication via `LINEAR_API_TOKEN` env var
-- [ ] Pagination
+- [x] `SubjectBackend` trait implementation against Linear's GraphQL API
+- [x] Status mapping (auto-discovered from team workflow; `LINEAR_STATUS_MAP` overrides)
+- [x] Authentication via `LINEAR_API_TOKEN` env var
+- [x] Pagination
+- [x] `patch.comment` posts a Linear comment via `commentCreate` (since v0.1.5; earlier versions incorrectly overwrote `description`)
 - [ ] Webhook support for real-time updates (`subject/watch`)
-- [ ] Contract test against `ao-subject-mock`
+- [ ] `subject/create` (waiting on protocol expansion; tracked in [animus-cli](https://github.com/launchapp-dev/animus-cli))
 - [ ] Release binaries (macOS aarch64/x86_64, Linux x86_64)
 
-Follow the [Animus core repo](https://github.com/launchapp-dev/animus-cli) for v0.4.0 progress.
+Follow the [Animus core repo](https://github.com/launchapp-dev/animus-cli) for protocol-level progress.
 
 ## License
 

@@ -6,6 +6,7 @@
 //! - `issues` for `subject/list`
 //! - `issue(id)` for `subject/get`
 //! - `issueUpdate` for `subject/update`
+//! - `commentCreate` for `subject/update` calls that carry `patch.comment`
 //! - `workflowStates` for status_id translation when writing `state` updates
 //!
 //! Queries are hand-rolled JSON rather than going through `graphql_client`
