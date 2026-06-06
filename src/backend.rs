@@ -167,6 +167,26 @@ impl LinearBackend {
         )
     }
 
+    /// Build the `commentCreate` mutation used when `SubjectPatch.comment` is set.
+    ///
+    /// Per the `SubjectPatch.comment` protocol contract ("Optional comment to
+    /// post alongside the update"), Linear posts the text as a real issue
+    /// comment via the `commentCreate` GraphQL mutation. We never write the
+    /// comment text into the issue's `description` — that would silently
+    /// destroy the issue body. The `issueId` argument is Linear's internal
+    /// UUID (not the `ENG-123` identifier), captured from the `issueUpdate`
+    /// (or `issue`) response.
+    fn comment_mutation() -> &'static str {
+        r#"
+        mutation AnimusCreateComment($input: CommentCreateInput!) {
+          commentCreate(input: $input) {
+            success
+            comment { id }
+          }
+        }
+        "#
+    }
+
     /// Build the `IssueFilter` GraphQL variable from a [`SubjectFilter`].
     fn build_issue_filter(&self, filter: &SubjectFilter, status_map: &StatusMap) -> Value {
         let mut graphql_filter = serde_json::Map::new();
@@ -407,9 +427,11 @@ impl LinearBackend {
             );
         }
 
-        if let Some(comment) = &patch.comment {
-            input.insert("description".to_string(), Value::String(comment.clone()));
-        }
+        // NOTE: `patch.comment` is intentionally NOT mapped to `description`
+        // here — that would overwrite the issue body. Linear treats comments
+        // as a separate activity stream, so [`SubjectBackend::update`] handles
+        // them via a follow-up [`Self::comment_mutation`] (`commentCreate`)
+        // GraphQL call after the `issueUpdate` succeeds.
 
         for (key, value) in &patch.custom {
             input.insert(key.clone(), value.clone());
@@ -516,36 +538,91 @@ impl SubjectBackend for LinearBackend {
         }
         let status_map = self.status_map().await?;
         let input = Self::build_update_input(&patch, status_map)?;
-        let variables = json!({ "id": native, "input": input });
-
-        let response = self
-            .client
-            .execute(&Self::update_mutation(), variables)
-            .await
-            .map_err(|e| BackendError::Unavailable(e.to_string()))?;
-
-        let data = response.into_data().map_err(map_graphql_err)?;
-
-        let payload = data.get("issueUpdate").ok_or_else(|| {
-            BackendError::Other(anyhow::anyhow!("missing `issueUpdate` in response"))
-        })?;
-
-        let success = payload
-            .get("success")
-            .and_then(|v| v.as_bool())
+        let input_has_fields = input
+            .as_object()
+            .map(|o| !o.is_empty())
             .unwrap_or(false);
-        if !success {
-            return Err(BackendError::InvalidRequest(format!(
-                "linear rejected update for {id}: {payload}"
-            )));
+
+        // Two paths into `issue`:
+        //   1. The patch has at least one field — call `issueUpdate` and use
+        //      the mutation's returned issue node.
+        //   2. The patch is comment-only — `issueUpdate` with empty input is
+        //      a no-op, so we fetch the issue with `AnimusGetIssue` instead.
+        // Both paths yield the same `ISSUE_FIELDS` shape, including the
+        // Linear-internal UUID used by `commentCreate`.
+        let issue = if input_has_fields {
+            let variables = json!({ "id": native, "input": input });
+            let response = self
+                .client
+                .execute(&Self::update_mutation(), variables)
+                .await
+                .map_err(|e| BackendError::Unavailable(e.to_string()))?;
+            let data = response.into_data().map_err(map_graphql_err)?;
+
+            let payload = data.get("issueUpdate").ok_or_else(|| {
+                BackendError::Other(anyhow::anyhow!("missing `issueUpdate` in response"))
+            })?;
+
+            let success = payload
+                .get("success")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            if !success {
+                return Err(BackendError::InvalidRequest(format!(
+                    "linear rejected update for {id}: {payload}"
+                )));
+            }
+
+            payload
+                .get("issue")
+                .filter(|v| !v.is_null())
+                .cloned()
+                .ok_or_else(|| BackendError::NotFound(id.to_string()))?
+        } else {
+            let variables = json!({ "id": native });
+            let response = self
+                .client
+                .execute(&Self::get_query(), variables)
+                .await
+                .map_err(|e| BackendError::Unavailable(e.to_string()))?;
+            let data = response.into_data().map_err(map_graphql_err)?;
+            data.get("issue")
+                .filter(|v| !v.is_null())
+                .cloned()
+                .ok_or_else(|| BackendError::NotFound(id.to_string()))?
+        };
+
+        // `patch.comment` translates to a Linear comment, not a description
+        // overwrite. Run the `commentCreate` mutation after the issue has
+        // been resolved so we have the canonical UUID Linear expects on the
+        // `issueId` argument.
+        if let Some(body) = patch.comment.as_deref().filter(|c| !c.is_empty()) {
+            let issue_uuid = issue.get("id").and_then(|v| v.as_str()).ok_or_else(|| {
+                BackendError::Other(anyhow::anyhow!(
+                    "linear response for {id} is missing issue.id; cannot post comment"
+                ))
+            })?;
+            let variables = json!({
+                "input": { "issueId": issue_uuid, "body": body }
+            });
+            let response = self
+                .client
+                .execute(Self::comment_mutation(), variables)
+                .await
+                .map_err(|e| BackendError::Unavailable(e.to_string()))?;
+            let data = response.into_data().map_err(map_graphql_err)?;
+            let success = data
+                .pointer("/commentCreate/success")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            if !success {
+                return Err(BackendError::InvalidRequest(format!(
+                    "linear rejected comment for {id}: {data}"
+                )));
+            }
         }
 
-        let issue = payload
-            .get("issue")
-            .filter(|v| !v.is_null())
-            .ok_or_else(|| BackendError::NotFound(id.to_string()))?;
-
-        Self::issue_to_subject(issue, status_map)
+        Self::issue_to_subject(&issue, status_map)
     }
 
     async fn watch(&self) -> Option<EventStream> {

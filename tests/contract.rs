@@ -802,3 +802,234 @@ async fn update_sends_state_id_not_state_name() {
     // team_states_default's Done is state-done.
     assert_eq!(state_id, "state-done");
 }
+
+// =====================================================================
+// `patch.comment` semantics (regression for GitHub issue #2):
+//
+// `SubjectPatch.comment` is "Optional comment to post alongside the
+// update" per `animus-subject-protocol`. Linear treats this as a real
+// activity-log comment via the `commentCreate` GraphQL mutation — NOT
+// as an overwrite of the issue body's `description` field.
+// =====================================================================
+
+/// When a patch carries a comment plus a real field change, `issueUpdate`
+/// must NOT include `description` and `commentCreate` must be called with
+/// the issue's UUID and the comment body.
+#[tokio::test]
+async fn update_with_comment_posts_via_comment_create_not_description() {
+    let mut server = Server::new_async().await;
+    let _team_states = server
+        .mock("POST", "/")
+        .match_body(matches_operation("AnimusTeamStates"))
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(fixture("team_states_default.json"))
+        .create_async()
+        .await;
+
+    let captured_update: Arc<Mutex<Option<serde_json::Value>>> = Arc::new(Mutex::new(None));
+    let captured_update_clone = captured_update.clone();
+    let _issue_update = server
+        .mock("POST", "/")
+        .match_body(matches_mutation("AnimusUpdateIssue"))
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body_from_request(move |req| {
+            let body = req.body().expect("body");
+            let parsed: serde_json::Value = serde_json::from_slice(body).unwrap_or_default();
+            *captured_update_clone.lock().unwrap() = Some(parsed);
+            fixture("update_issue_ok.json").into_bytes()
+        })
+        .create_async()
+        .await;
+
+    let captured_comment: Arc<Mutex<Option<serde_json::Value>>> = Arc::new(Mutex::new(None));
+    let captured_comment_clone = captured_comment.clone();
+    let comment_mock = server
+        .mock("POST", "/")
+        .match_body(matches_mutation("AnimusCreateComment"))
+        .expect(1)
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body_from_request(move |req| {
+            let body = req.body().expect("body");
+            let parsed: serde_json::Value = serde_json::from_slice(body).unwrap_or_default();
+            *captured_comment_clone.lock().unwrap() = Some(parsed);
+            fixture("comment_create_ok.json").into_bytes()
+        })
+        .create_async()
+        .await;
+
+    let backend = backend_against(&server.url());
+    let patch = SubjectPatch {
+        status: Some(SubjectStatus::InProgress),
+        comment: Some("draft ready for review".to_string()),
+        ..Default::default()
+    };
+    backend
+        .update(&SubjectId::new("linear:ENG-1"), patch)
+        .await
+        .expect("update with comment should succeed");
+
+    // 1. issueUpdate must NOT include `description` — that would overwrite
+    //    the issue body with the comment text.
+    let update_body = captured_update
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("issueUpdate was called");
+    let update_input = update_body
+        .pointer("/variables/input")
+        .expect("issueUpdate variables has input");
+    assert!(
+        update_input.get("description").is_none(),
+        "patch.comment must NOT be written to issue.description: {update_input}"
+    );
+
+    // 2. commentCreate must be called with the issue UUID and body.
+    comment_mock.assert_async().await;
+    let comment_body = captured_comment
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("commentCreate was called");
+    let comment_input = comment_body
+        .pointer("/variables/input")
+        .expect("commentCreate variables has input");
+    assert_eq!(
+        comment_input.get("issueId").and_then(|v| v.as_str()),
+        Some("11111111-1111-4111-8111-111111111111"),
+        "comment must address the Linear issue UUID, not the identifier: {comment_input}"
+    );
+    assert_eq!(
+        comment_input.get("body").and_then(|v| v.as_str()),
+        Some("draft ready for review")
+    );
+}
+
+/// When the patch carries ONLY a comment (no other field changes), the
+/// backend must skip `issueUpdate` (Linear treats empty input as a no-op
+/// but it's still a wasted round-trip), fetch the issue via `AnimusGetIssue`
+/// to resolve its UUID, and post the comment via `commentCreate`.
+#[tokio::test]
+async fn update_with_only_comment_skips_issue_update_and_uses_get() {
+    let mut server = Server::new_async().await;
+    let _team_states = server
+        .mock("POST", "/")
+        .match_body(matches_operation("AnimusTeamStates"))
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(fixture("team_states_default.json"))
+        .create_async()
+        .await;
+
+    // issueUpdate must NOT be called when the patch has no field changes.
+    let no_update = server
+        .mock("POST", "/")
+        .match_body(matches_mutation("AnimusUpdateIssue"))
+        .expect(0)
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(fixture("update_issue_ok.json"))
+        .create_async()
+        .await;
+
+    let get_called = server
+        .mock("POST", "/")
+        .match_body(matches_operation("AnimusGetIssue"))
+        .expect(1)
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(fixture("get_one_issue.json"))
+        .create_async()
+        .await;
+
+    let captured_comment: Arc<Mutex<Option<serde_json::Value>>> = Arc::new(Mutex::new(None));
+    let captured_comment_clone = captured_comment.clone();
+    let comment_called = server
+        .mock("POST", "/")
+        .match_body(matches_mutation("AnimusCreateComment"))
+        .expect(1)
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body_from_request(move |req| {
+            let body = req.body().expect("body");
+            let parsed: serde_json::Value = serde_json::from_slice(body).unwrap_or_default();
+            *captured_comment_clone.lock().unwrap() = Some(parsed);
+            fixture("comment_create_ok.json").into_bytes()
+        })
+        .create_async()
+        .await;
+
+    let backend = backend_against(&server.url());
+    let patch = SubjectPatch {
+        comment: Some("workflow started".to_string()),
+        ..Default::default()
+    };
+    backend
+        .update(&SubjectId::new("linear:ENG-1"), patch)
+        .await
+        .expect("comment-only update should succeed");
+
+    no_update.assert_async().await;
+    get_called.assert_async().await;
+    comment_called.assert_async().await;
+
+    let comment_body = captured_comment
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("commentCreate was called");
+    let issue_id = comment_body
+        .pointer("/variables/input/issueId")
+        .and_then(|v| v.as_str())
+        .expect("issueId");
+    assert_eq!(issue_id, "11111111-1111-4111-8111-111111111111");
+}
+
+/// `Some("")` for `patch.comment` is treated as "no comment" — we don't
+/// burn a `commentCreate` round trip to post an empty body.
+#[tokio::test]
+async fn update_with_empty_comment_skips_comment_create() {
+    let mut server = Server::new_async().await;
+    let _team_states = server
+        .mock("POST", "/")
+        .match_body(matches_operation("AnimusTeamStates"))
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(fixture("team_states_default.json"))
+        .create_async()
+        .await;
+
+    let _update = server
+        .mock("POST", "/")
+        .match_body(matches_mutation("AnimusUpdateIssue"))
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(fixture("update_issue_ok.json"))
+        .create_async()
+        .await;
+
+    let no_comment = server
+        .mock("POST", "/")
+        .match_body(matches_mutation("AnimusCreateComment"))
+        .expect(0)
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(fixture("comment_create_ok.json"))
+        .create_async()
+        .await;
+
+    let backend = backend_against(&server.url());
+    let patch = SubjectPatch {
+        status: Some(SubjectStatus::Done),
+        comment: Some(String::new()),
+        ..Default::default()
+    };
+    backend
+        .update(&SubjectId::new("linear:ENG-1"), patch)
+        .await
+        .expect("update ok");
+
+    no_comment.assert_async().await;
+}
