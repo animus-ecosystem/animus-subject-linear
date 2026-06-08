@@ -649,6 +649,7 @@ impl SubjectBackend for LinearBackend {
             ],
             supports_watch: false,
             supports_create: false,
+            supports_delete: false,
             supports_pagination: true,
             // `schema()` is sync; runtime discovery from Linear is async.
             // Surface a sensible static fallback that lists the well-known
