@@ -159,6 +159,7 @@ async fn get_returns_subject_by_id() {
     assert_eq!(subject.kind, "issue");
     assert_eq!(subject.title, "Investigate flaky test");
     assert_eq!(subject.status, SubjectStatus::Ready);
+    assert_eq!(subject.native_status.as_deref(), Some("Todo"));
     assert_eq!(
         subject.description.as_deref(),
         Some("The webhook integration test fails ~10% of the time.")
@@ -257,17 +258,20 @@ async fn update_translates_patch() {
         input.get("assigneeId").and_then(|v| v.as_str()),
         Some("bob@example.com")
     );
-    let label_ids = input.get("labelIds").expect("input has labelIds");
+    assert!(
+        input.get("labelIds").is_none(),
+        "update must not emit a replace-all labelIds payload: {input}"
+    );
     assert_eq!(
-        label_ids
-            .get("add")
+        input
+            .get("addedLabelIds")
             .and_then(|v| v.as_array())
             .map(|v| v.len()),
         Some(1)
     );
     assert_eq!(
-        label_ids
-            .get("remove")
+        input
+            .get("removedLabelIds")
             .and_then(|v| v.as_array())
             .map(|v| v.len()),
         Some(1)
@@ -450,6 +454,54 @@ async fn list_returns_next_cursor_when_paginating() {
         .expect("list ok");
     assert_eq!(page.next_cursor.as_deref(), Some("cursor-page-2"));
     let _placeholder: Option<Subject> = page.subjects.into_iter().next();
+}
+
+#[tokio::test]
+async fn list_filters_by_native_status_state_name() {
+    let mut server = Server::new_async().await;
+    let _team_states = server
+        .mock("POST", "/")
+        .match_body(matches_operation("AnimusTeamStates"))
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(fixture("team_states_default.json"))
+        .create_async()
+        .await;
+
+    let captured: Arc<Mutex<Option<serde_json::Value>>> = Arc::new(Mutex::new(None));
+    let captured_clone = captured.clone();
+    let _m = server
+        .mock("POST", "/")
+        .match_body(matches_operation("AnimusListIssues"))
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body_from_request(move |req| {
+            let body = req.body().expect("mockito should expose request body");
+            let parsed: serde_json::Value = serde_json::from_slice(body).unwrap_or_default();
+            *captured_clone.lock().unwrap() = Some(parsed);
+            fixture("list_three_issues.json").into_bytes()
+        })
+        .create_async()
+        .await;
+
+    let backend = backend_against(&server.url());
+    let filter = SubjectFilter {
+        native_status: Some("In Review".to_string()),
+        ..Default::default()
+    };
+    backend.list(filter).await.expect("list should succeed");
+
+    let body = captured
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("server saw a request body");
+    assert_eq!(
+        body.pointer("/variables/filter/state/name/eq")
+            .and_then(|v| v.as_str()),
+        Some("In Review"),
+        "native_status must translate to a state.name.eq filter"
+    );
 }
 
 /// Regression for the `--manifest` bug: building a backend without a

@@ -195,6 +195,7 @@ impl LinearBackend {
             graphql_filter.insert("team".to_string(), json!({ "id": { "eq": team_id } }));
         }
 
+        let mut state_filter = serde_json::Map::new();
         if !filter.status.is_empty() {
             // Map each requested animus status to all Linear state UUIDs
             // that resolve to it. We filter by stateId rather than name
@@ -206,8 +207,14 @@ impl LinearBackend {
                 .map(|(id, _, _)| id.to_string())
                 .collect();
             if !state_ids.is_empty() {
-                graphql_filter.insert("state".to_string(), json!({ "id": { "in": state_ids } }));
+                state_filter.insert("id".to_string(), json!({ "in": state_ids }));
             }
+        }
+        if let Some(native_status) = &filter.native_status {
+            state_filter.insert("name".to_string(), json!({ "eq": native_status }));
+        }
+        if !state_filter.is_empty() {
+            graphql_filter.insert("state".to_string(), Value::Object(state_filter));
         }
 
         if !filter.assignee.is_empty() {
@@ -392,7 +399,11 @@ impl LinearBackend {
             created_at,
             updated_at,
             custom,
-            native_status: None,
+            native_status: if state_name.is_empty() {
+                None
+            } else {
+                Some(state_name.to_string())
+            },
             status_metadata: Value::Null,
             attachments: Vec::new(),
         })
@@ -417,14 +428,11 @@ impl LinearBackend {
             input.insert("assigneeId".to_string(), Value::Null);
         }
 
-        if !patch.labels_add.is_empty() || !patch.labels_remove.is_empty() {
-            input.insert(
-                "labelIds".to_string(),
-                json!({
-                    "add": patch.labels_add,
-                    "remove": patch.labels_remove
-                }),
-            );
+        if !patch.labels_add.is_empty() {
+            input.insert("addedLabelIds".to_string(), json!(patch.labels_add));
+        }
+        if !patch.labels_remove.is_empty() {
+            input.insert("removedLabelIds".to_string(), json!(patch.labels_remove));
         }
 
         // NOTE: `patch.comment` is intentionally NOT mapped to `description`
@@ -538,10 +546,7 @@ impl SubjectBackend for LinearBackend {
         }
         let status_map = self.status_map().await?;
         let input = Self::build_update_input(&patch, status_map)?;
-        let input_has_fields = input
-            .as_object()
-            .map(|o| !o.is_empty())
-            .unwrap_or(false);
+        let input_has_fields = input.as_object().map(|o| !o.is_empty()).unwrap_or(false);
 
         // Two paths into `issue`:
         //   1. The patch has at least one field — call `issueUpdate` and use

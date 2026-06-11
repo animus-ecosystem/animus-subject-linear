@@ -1,6 +1,6 @@
 schema = "animus.plugin.v1"
 name = "animus-subject-linear"
-version = "0.1.6"
+version = "0.1.7"
 plugin_kind = "subject_backend"
 description = "Linear subject backend for Animus"
 
