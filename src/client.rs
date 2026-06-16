@@ -91,6 +91,7 @@ pub struct LinearClient {
     http: Client,
     api_url: String,
     team_id: Option<String>,
+    project_id: Option<String>,
     has_token: bool,
 }
 
@@ -126,6 +127,7 @@ impl LinearClient {
             http,
             api_url: config.api_url.clone(),
             team_id: config.team_id.clone(),
+            project_id: config.project_id.clone(),
             has_token,
         })
     }
@@ -133,6 +135,11 @@ impl LinearClient {
     /// Team scope for `list` queries, if configured.
     pub fn team_id(&self) -> Option<&str> {
         self.team_id.as_deref()
+    }
+
+    /// Project scope for `issue/create`, if configured.
+    pub fn project_id(&self) -> Option<&str> {
+        self.project_id.as_deref()
     }
 
     /// Whether a `LINEAR_API_TOKEN` was present at construction.
