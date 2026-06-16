@@ -1,6 +1,6 @@
 [package]
 name = "animus-subject-linear"
-version = "0.1.7"
+version = "0.1.8"
 edition = "2021"
 license = "MIT"
 description = "Linear (linear.app) subject backend plugin for Animus"

@@ -1354,10 +1354,9 @@ async fn create_requires_token() {
         .await
         .expect_err("missing token must error");
     match err {
-        BackendError::Other(e) => assert!(
-            e.to_string().contains("LINEAR_API_TOKEN required"),
-            "{e}"
-        ),
+        BackendError::Other(e) => {
+            assert!(e.to_string().contains("LINEAR_API_TOKEN required"), "{e}")
+        }
         other => panic!("expected BackendError::Other, got {other:?}"),
     }
 }
