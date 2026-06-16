@@ -16,11 +16,12 @@ use animus_subject_protocol::{
 };
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::sync::OnceCell;
 
 use crate::client::LinearClient;
-use crate::config::LinearConfig;
+use crate::config::{parse_subject_status, LinearConfig};
 use crate::status_map::{self, StatusMap};
 
 const ID_PREFIX: &str = "linear:";
@@ -64,6 +65,36 @@ pub struct LinearBackend {
     /// `Arc` so the backend stays `Clone` (the plugin host clones it across
     /// inbound dispatch calls) while sharing the single discovered map.
     status_map: Arc<OnceCell<StatusMap>>,
+}
+
+/// Flat request payload for `issue/create` / `subject/create`.
+///
+/// The daemon's `SubjectRouter` sends create params at the TOP LEVEL (unlike
+/// `subject/update`, which wraps fields under `patch`). The CLI emits
+/// `{title, body?, status?, priority?, labels?}`; richer callers (e.g.
+/// `animus plugin call`) may also pass `project_id` / `team_id`.
+#[derive(Debug, Deserialize)]
+pub struct CreateRequest {
+    /// Issue title. Required; rejected when empty/whitespace.
+    pub title: String,
+    /// Markdown body. Maps to Linear's `description` (the wire key is `body`).
+    #[serde(default)]
+    pub body: Option<String>,
+    /// Normalized lowercase status string (`ready`/`in-progress`/...).
+    #[serde(default)]
+    pub status: Option<String>,
+    /// Priority bucket string (`p0`..`p3`), NOT a Linear integer.
+    #[serde(default)]
+    pub priority: Option<String>,
+    /// Label names. Not yet honored on create in v0.1.8 (logged + dropped).
+    #[serde(default)]
+    pub labels: Vec<String>,
+    /// Optional project UUID; falls back to `LINEAR_PROJECT_ID`.
+    #[serde(default)]
+    pub project_id: Option<String>,
+    /// Optional team UUID/key; falls back to `LINEAR_TEAM_ID`.
+    #[serde(default)]
+    pub team_id: Option<String>,
 }
 
 impl LinearBackend {
@@ -157,6 +188,21 @@ impl LinearBackend {
             r#"
             mutation AnimusUpdateIssue($id: String!, $input: IssueUpdateInput!) {{
               issueUpdate(id: $id, input: $input) {{
+                success
+                issue {{
+                  {ISSUE_FIELDS}
+                }}
+              }}
+            }}
+            "#
+        )
+    }
+
+    fn create_mutation() -> String {
+        format!(
+            r#"
+            mutation AnimusCreateIssue($input: IssueCreateInput!) {{
+              issueCreate(input: $input) {{
                 success
                 issue {{
                   {ISSUE_FIELDS}
@@ -456,6 +502,113 @@ impl LinearBackend {
 
         Ok(Value::Object(input))
     }
+
+    /// Create a Linear issue from a flat [`CreateRequest`] via `issueCreate`.
+    ///
+    /// Inherent method (not a trait verb): `main.rs` registers it on the
+    /// generic `Plugin` shell for the `issue/create` + `subject/create`
+    /// methods. Reuses the same helpers as `update()`: `status_map`,
+    /// `animus_to_linear_state_id`, `issue_to_subject`, `map_graphql_err`.
+    pub async fn create(&self, req: CreateRequest) -> Result<Subject, BackendError> {
+        if !self.client.has_token() {
+            return Err(missing_token_error());
+        }
+
+        let title = req.title.trim();
+        if title.is_empty() {
+            return Err(BackendError::InvalidRequest(
+                "title must not be empty".to_string(),
+            ));
+        }
+
+        let team_id = req
+            .team_id
+            .clone()
+            .or_else(|| self.client.team_id().map(str::to_string))
+            .ok_or_else(|| {
+                BackendError::InvalidRequest(
+                    "LINEAR_TEAM_ID must be set to create issues".to_string(),
+                )
+            })?;
+
+        if !req.labels.is_empty() {
+            tracing::warn!(
+                target: "animus_subject_linear",
+                labels = ?req.labels,
+                "issue/create received labels but label assignment on create is not \
+                 supported in v0.1.8; creating the issue without them"
+            );
+        }
+
+        // Only fetch the team's workflow map when a status was requested.
+        // A status-less create still translates the *returned* issue via the
+        // `WorkflowState.type` fallback in `issue_to_subject`, so an empty
+        // map is sufficient there — and we avoid a wasted round-trip.
+        let default_map;
+        let status_map: &StatusMap = if req.status.is_some() {
+            self.status_map().await?
+        } else {
+            default_map = StatusMap::default();
+            &default_map
+        };
+
+        let mut input = serde_json::Map::new();
+        input.insert("teamId".to_string(), json!(team_id));
+        input.insert("title".to_string(), json!(title));
+
+        if let Some(body) = req.body.as_deref().filter(|b| !b.is_empty()) {
+            input.insert("description".to_string(), json!(body));
+        }
+        if let Some(project) = req
+            .project_id
+            .clone()
+            .or_else(|| self.client.project_id().map(str::to_string))
+        {
+            input.insert("projectId".to_string(), json!(project));
+        }
+        if let Some(priority) = req.priority.as_deref().and_then(priority_bucket_to_linear) {
+            input.insert("priority".to_string(), json!(priority));
+        }
+        if let Some(status_str) = req.status.as_deref() {
+            let status = parse_subject_status(status_str).ok_or_else(|| {
+                BackendError::InvalidRequest(format!("unknown status {status_str:?}"))
+            })?;
+            let state_id = status_map.animus_to_linear_state_id(status).ok_or_else(|| {
+                BackendError::InvalidRequest(format!(
+                    "no Linear workflow state maps to animus status {status:?}; configure LINEAR_STATUS_MAP env var to override"
+                ))
+            })?;
+            input.insert("stateId".to_string(), json!(state_id));
+        }
+
+        let response = self
+            .client
+            .execute(&Self::create_mutation(), json!({ "input": input }))
+            .await
+            .map_err(|e| BackendError::Unavailable(e.to_string()))?;
+        let data = response.into_data().map_err(map_graphql_err)?;
+        let payload = data.get("issueCreate").ok_or_else(|| {
+            BackendError::Other(anyhow::anyhow!("missing `issueCreate` in response"))
+        })?;
+        let success = payload
+            .get("success")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        if !success {
+            return Err(BackendError::InvalidRequest(format!(
+                "linear rejected issue create: {payload}"
+            )));
+        }
+        let issue = payload
+            .get("issue")
+            .filter(|v| !v.is_null())
+            .cloned()
+            .ok_or_else(|| {
+                BackendError::Other(anyhow::anyhow!("issueCreate returned no issue node"))
+            })?;
+
+        Self::issue_to_subject(&issue, status_map)
+    }
 }
 
 #[async_trait]
@@ -653,7 +806,7 @@ impl SubjectBackend for LinearBackend {
                 SubjectStatus::Cancelled,
             ],
             supports_watch: false,
-            supports_create: false,
+            supports_create: true,
             supports_delete: false,
             supports_pagination: true,
             // `schema()` is sync; runtime discovery from Linear is async.
@@ -761,5 +914,35 @@ fn map_graphql_err(error: anyhow::Error) -> BackendError {
         BackendError::NotFound(message)
     } else {
         BackendError::Unavailable(message)
+    }
+}
+
+/// Map an Animus priority bucket (`"p0"`..`"p3"`) to Linear's integer
+/// `priority` field. Linear uses `0 = No priority, 1 = Urgent, 2 = High,
+/// 3 = Normal, 4 = Low`; we map the four Animus buckets onto Linear's four
+/// real priorities (`p0` = most urgent -> `1`), leaving Linear's `0` unused.
+/// An unknown bucket returns `None`, so the field is omitted and Linear
+/// applies the team default.
+fn priority_bucket_to_linear(bucket: &str) -> Option<i64> {
+    match bucket {
+        "p0" | "P0" => Some(1),
+        "p1" | "P1" => Some(2),
+        "p2" | "P2" => Some(3),
+        "p3" | "P3" => Some(4),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn priority_buckets_map_to_linear_ints() {
+        assert_eq!(priority_bucket_to_linear("p0"), Some(1));
+        assert_eq!(priority_bucket_to_linear("p1"), Some(2));
+        assert_eq!(priority_bucket_to_linear("p2"), Some(3));
+        assert_eq!(priority_bucket_to_linear("p3"), Some(4));
+        assert_eq!(priority_bucket_to_linear("urgent"), None);
     }
 }
