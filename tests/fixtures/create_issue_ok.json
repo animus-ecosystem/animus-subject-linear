@@ -1,0 +1,22 @@
+{
+  "data": {
+    "issueCreate": {
+      "success": true,
+      "issue": {
+        "id": "22222222-2222-4222-8222-222222222222",
+        "identifier": "ENG-42",
+        "title": "Rental yields 2026",
+        "description": "Structured body",
+        "priority": 2,
+        "url": "https://linear.app/launchapp/issue/ENG-42",
+        "createdAt": "2026-06-16T10:00:00.000Z",
+        "updatedAt": "2026-06-16T10:00:00.000Z",
+        "state": { "id": "state-todo", "name": "Todo", "type": "unstarted" },
+        "assignee": null,
+        "labels": { "nodes": [] },
+        "parent": null,
+        "children": { "nodes": [] }
+      }
+    }
+  }
+}

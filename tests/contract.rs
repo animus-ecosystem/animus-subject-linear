@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::sync::Mutex;
 
 use animus_plugin_protocol::HealthStatus;
-use animus_subject_linear::backend::LinearBackend;
+use animus_subject_linear::backend::{CreateRequest, LinearBackend};
 use animus_subject_linear::config::LinearConfig;
 use animus_subject_protocol::{
     BackendError, Subject, SubjectBackend, SubjectFilter, SubjectId, SubjectPatch, SubjectStatus,
@@ -40,6 +40,17 @@ fn backend_without_token(url: &str) -> LinearBackend {
 fn backend_with_overrides(url: &str, overrides: HashMap<String, SubjectStatus>) -> LinearBackend {
     let config = LinearConfig::new("test-token", url, Some("ENG".to_string()))
         .with_status_overrides(overrides);
+    LinearBackend::new(config).expect("backend should build")
+}
+
+fn backend_with_project(url: &str, project: &str) -> LinearBackend {
+    let config = LinearConfig::new("test-token", url, Some("ENG".to_string()))
+        .with_project_id(Some(project.to_string()));
+    LinearBackend::new(config).expect("backend should build")
+}
+
+fn backend_without_team(url: &str) -> LinearBackend {
+    let config = LinearConfig::new("test-token", url, None);
     LinearBackend::new(config).expect("backend should build")
 }
 
@@ -1084,4 +1095,279 @@ async fn update_with_empty_comment_skips_comment_create() {
         .expect("update ok");
 
     no_comment.assert_async().await;
+}
+
+// =====================================================================
+// `issue/create` (Linear `issueCreate`) contract tests.
+// =====================================================================
+
+#[tokio::test]
+async fn create_translates_full_payload() {
+    let mut server = Server::new_async().await;
+    let _team_states = server
+        .mock("POST", "/")
+        .match_body(matches_operation("AnimusTeamStates"))
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(fixture("team_states_default.json"))
+        .create_async()
+        .await;
+
+    let captured: Arc<Mutex<Option<serde_json::Value>>> = Arc::new(Mutex::new(None));
+    let captured_clone = captured.clone();
+    let _create = server
+        .mock("POST", "/")
+        .match_body(matches_mutation("AnimusCreateIssue"))
+        .match_header("authorization", "test-token")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body_from_request(move |req| {
+            let body = req.body().expect("body");
+            let parsed: serde_json::Value = serde_json::from_slice(body).unwrap_or_default();
+            *captured_clone.lock().unwrap() = Some(parsed);
+            fixture("create_issue_ok.json").into_bytes()
+        })
+        .create_async()
+        .await;
+
+    let backend = backend_with_project(&server.url(), "proj-123");
+    let req = CreateRequest {
+        title: "Rental yields 2026".to_string(),
+        body: Some("Structured body".to_string()),
+        status: Some("ready".to_string()),
+        priority: Some("p1".to_string()),
+        labels: vec![],
+        project_id: None,
+        team_id: None,
+    };
+
+    let subject = backend.create(req).await.expect("create should succeed");
+    assert_eq!(subject.id.as_str(), "linear:ENG-42");
+    assert_eq!(subject.kind, "issue");
+
+    let body = captured.lock().unwrap().clone().expect("server saw a body");
+    let input = body.pointer("/variables/input").expect("has input");
+    assert_eq!(input.get("teamId").and_then(|v| v.as_str()), Some("ENG"));
+    assert_eq!(
+        input.get("title").and_then(|v| v.as_str()),
+        Some("Rental yields 2026")
+    );
+    assert_eq!(
+        input.get("description").and_then(|v| v.as_str()),
+        Some("Structured body")
+    );
+    assert_eq!(
+        input.get("projectId").and_then(|v| v.as_str()),
+        Some("proj-123")
+    );
+    assert_eq!(input.get("priority").and_then(|v| v.as_i64()), Some(2));
+    assert_eq!(
+        input.get("stateId").and_then(|v| v.as_str()),
+        Some("state-todo"),
+        "status `ready` must resolve to the lowest-position Ready state"
+    );
+}
+
+#[tokio::test]
+async fn create_rejects_empty_title() {
+    let server = Server::new_async().await;
+    let backend = backend_against(&server.url());
+    let req = CreateRequest {
+        title: "   ".to_string(),
+        body: None,
+        status: None,
+        priority: None,
+        labels: vec![],
+        project_id: None,
+        team_id: None,
+    };
+    let err = backend
+        .create(req)
+        .await
+        .expect_err("empty title must be rejected");
+    match err {
+        BackendError::InvalidRequest(msg) => assert!(msg.contains("title"), "{msg}"),
+        other => panic!("expected InvalidRequest, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn create_requires_team_id() {
+    let server = Server::new_async().await;
+    let backend = backend_without_team(&server.url());
+    let req = CreateRequest {
+        title: "No team".to_string(),
+        body: None,
+        status: None,
+        priority: None,
+        labels: vec![],
+        project_id: None,
+        team_id: None,
+    };
+    let err = backend
+        .create(req)
+        .await
+        .expect_err("missing team must error");
+    match err {
+        BackendError::InvalidRequest(msg) => assert!(msg.contains("LINEAR_TEAM_ID"), "{msg}"),
+        other => panic!("expected InvalidRequest, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn create_omits_state_id_when_status_absent() {
+    let mut server = Server::new_async().await;
+    // A status-less create must NOT fetch the workflow map.
+    let no_states = server
+        .mock("POST", "/")
+        .match_body(matches_operation("AnimusTeamStates"))
+        .expect(0)
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(fixture("team_states_default.json"))
+        .create_async()
+        .await;
+
+    let captured: Arc<Mutex<Option<serde_json::Value>>> = Arc::new(Mutex::new(None));
+    let captured_clone = captured.clone();
+    let _create = server
+        .mock("POST", "/")
+        .match_body(matches_mutation("AnimusCreateIssue"))
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body_from_request(move |req| {
+            let body = req.body().expect("body");
+            let parsed: serde_json::Value = serde_json::from_slice(body).unwrap_or_default();
+            *captured_clone.lock().unwrap() = Some(parsed);
+            fixture("create_issue_ok.json").into_bytes()
+        })
+        .create_async()
+        .await;
+
+    let backend = backend_against(&server.url());
+    let req = CreateRequest {
+        title: "No status".to_string(),
+        body: None,
+        status: None,
+        priority: None,
+        labels: vec![],
+        project_id: None,
+        team_id: None,
+    };
+    backend.create(req).await.expect("create ok");
+
+    no_states.assert_async().await;
+    let body = captured.lock().unwrap().clone().expect("body");
+    let input = body.pointer("/variables/input").expect("input");
+    assert!(
+        input.get("stateId").is_none(),
+        "no status -> no stateId: {input}"
+    );
+}
+
+#[tokio::test]
+async fn create_omits_labels_on_wire() {
+    let mut server = Server::new_async().await;
+    let captured: Arc<Mutex<Option<serde_json::Value>>> = Arc::new(Mutex::new(None));
+    let captured_clone = captured.clone();
+    let _create = server
+        .mock("POST", "/")
+        .match_body(matches_mutation("AnimusCreateIssue"))
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body_from_request(move |req| {
+            let body = req.body().expect("body");
+            let parsed: serde_json::Value = serde_json::from_slice(body).unwrap_or_default();
+            *captured_clone.lock().unwrap() = Some(parsed);
+            fixture("create_issue_ok.json").into_bytes()
+        })
+        .create_async()
+        .await;
+
+    let backend = backend_against(&server.url());
+    let req = CreateRequest {
+        title: "Has labels".to_string(),
+        body: None,
+        status: None,
+        priority: None,
+        labels: vec!["market".to_string(), "investment".to_string()],
+        project_id: None,
+        team_id: None,
+    };
+    backend.create(req).await.expect("create ok");
+
+    let body = captured.lock().unwrap().clone().expect("body");
+    let input = body.pointer("/variables/input").expect("input");
+    assert!(
+        input.get("labelIds").is_none(),
+        "labels are not yet sent on create in v0.1.8: {input}"
+    );
+}
+
+#[tokio::test]
+async fn create_propagates_rejection() {
+    let mut server = Server::new_async().await;
+    let _create = server
+        .mock("POST", "/")
+        .match_body(matches_mutation("AnimusCreateIssue"))
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(r#"{ "data": { "issueCreate": { "success": false, "issue": null } } }"#)
+        .create_async()
+        .await;
+
+    let backend = backend_against(&server.url());
+    let req = CreateRequest {
+        title: "Will fail".to_string(),
+        body: None,
+        status: None,
+        priority: None,
+        labels: vec![],
+        project_id: None,
+        team_id: None,
+    };
+    let err = backend
+        .create(req)
+        .await
+        .expect_err("rejection should surface");
+    match err {
+        BackendError::InvalidRequest(msg) => assert!(msg.contains("linear rejected"), "{msg}"),
+        other => panic!("expected InvalidRequest, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn create_requires_token() {
+    let server = Server::new_async().await;
+    let backend = backend_without_token(&server.url());
+    let req = CreateRequest {
+        title: "No token".to_string(),
+        body: None,
+        status: None,
+        priority: None,
+        labels: vec![],
+        project_id: None,
+        team_id: None,
+    };
+    let err = backend
+        .create(req)
+        .await
+        .expect_err("missing token must error");
+    match err {
+        BackendError::Other(e) => assert!(
+            e.to_string().contains("LINEAR_API_TOKEN required"),
+            "{e}"
+        ),
+        other => panic!("expected BackendError::Other, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn schema_advertises_supports_create() {
+    let server = Server::new_async().await;
+    let backend = backend_against(&server.url());
+    assert!(
+        backend.schema().supports_create,
+        "v0.1.8 must advertise supports_create"
+    );
 }
