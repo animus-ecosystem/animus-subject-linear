@@ -38,6 +38,10 @@ pub const ENV_API_URL: &str = "LINEAR_API_URL";
 /// JSON blob also falls back to the empty map rather than crashing the plugin.
 pub const ENV_STATUS_MAP: &str = "LINEAR_STATUS_MAP";
 
+/// Environment variable holding the Linear project UUID to file new issues
+/// into. Optional; read only by the `issue/create` path.
+pub const ENV_PROJECT_ID: &str = "LINEAR_PROJECT_ID";
+
 /// Runtime configuration for the Linear backend plugin.
 #[derive(Debug, Clone)]
 pub struct LinearConfig {
@@ -51,6 +55,9 @@ pub struct LinearConfig {
     pub api_url: String,
     /// Optional team identifier; when set, `list` queries are constrained to this team.
     pub team_id: Option<String>,
+    /// Optional project UUID attached to issues created via `issue/create`.
+    /// `None` means "let Linear leave the issue project-less".
+    pub project_id: Option<String>,
     /// User-supplied overrides for the status auto-map. See [`ENV_STATUS_MAP`].
     /// Keys are Linear `WorkflowState.name` strings (case-sensitive); values
     /// are the normalized [`SubjectStatus`] they should map to. Empty by
@@ -69,6 +76,7 @@ impl LinearConfig {
         let api_url =
             std::env::var(ENV_API_URL).unwrap_or_else(|_| DEFAULT_LINEAR_API_URL.to_string());
         let team_id = std::env::var(ENV_TEAM_ID).ok().filter(|s| !s.is_empty());
+        let project_id = std::env::var(ENV_PROJECT_ID).ok().filter(|s| !s.is_empty());
         let status_overrides = std::env::var(ENV_STATUS_MAP)
             .ok()
             .filter(|s| !s.is_empty())
@@ -78,6 +86,7 @@ impl LinearConfig {
             api_token,
             api_url,
             team_id,
+            project_id,
             status_overrides,
         })
     }
@@ -93,6 +102,7 @@ impl LinearConfig {
             api_token: Some(api_token.into()),
             api_url: api_url.into(),
             team_id,
+            project_id: None,
             status_overrides: HashMap::new(),
         }
     }
@@ -104,6 +114,7 @@ impl LinearConfig {
             api_token: None,
             api_url: api_url.into(),
             team_id,
+            project_id: None,
             status_overrides: HashMap::new(),
         }
     }
@@ -112,6 +123,13 @@ impl LinearConfig {
     /// map. Mirrors what [`Self::from_env`] would build from [`ENV_STATUS_MAP`].
     pub fn with_status_overrides(mut self, overrides: HashMap<String, SubjectStatus>) -> Self {
         self.status_overrides = overrides;
+        self
+    }
+
+    /// In-memory builder that sets [`project_id`](Self::project_id). Mirrors
+    /// what [`Self::from_env`] reads from [`ENV_PROJECT_ID`].
+    pub fn with_project_id(mut self, project_id: Option<String>) -> Self {
+        self.project_id = project_id;
         self
     }
 }
@@ -169,7 +187,7 @@ fn parse_status_overrides(raw: &str) -> HashMap<String, SubjectStatus> {
 /// `LINEAR_STATUS_MAP` to [`SubjectStatus`]. Also accepts the kebab-case
 /// serde form (`"in-progress"`) for users who write the map as JSON output
 /// from another tool.
-fn parse_subject_status(raw: &str) -> Option<SubjectStatus> {
+pub(crate) fn parse_subject_status(raw: &str) -> Option<SubjectStatus> {
     match raw {
         "Ready" | "ready" => Some(SubjectStatus::Ready),
         "InProgress" | "in-progress" | "in_progress" => Some(SubjectStatus::InProgress),
@@ -211,11 +229,13 @@ mod tests {
         let saved_url = std::env::var(ENV_API_URL).ok();
         let saved_team = std::env::var(ENV_TEAM_ID).ok();
         let saved_status_map = std::env::var(ENV_STATUS_MAP).ok();
+        let saved_project = std::env::var(ENV_PROJECT_ID).ok();
 
         std::env::remove_var(ENV_API_TOKEN);
         std::env::remove_var(ENV_API_URL);
         std::env::remove_var(ENV_TEAM_ID);
         std::env::remove_var(ENV_STATUS_MAP);
+        std::env::remove_var(ENV_PROJECT_ID);
 
         let cfg = LinearConfig::from_env().expect("from_env must be lenient about missing token");
         assert!(
@@ -224,6 +244,7 @@ mod tests {
         );
         assert_eq!(cfg.api_url, DEFAULT_LINEAR_API_URL);
         assert!(cfg.team_id.is_none());
+        assert!(cfg.project_id.is_none());
         assert!(cfg.status_overrides.is_empty());
 
         if let Some(v) = saved_token {
@@ -237,6 +258,9 @@ mod tests {
         }
         if let Some(v) = saved_status_map {
             std::env::set_var(ENV_STATUS_MAP, v);
+        }
+        if let Some(v) = saved_project {
+            std::env::set_var(ENV_PROJECT_ID, v);
         }
     }
 
