@@ -16,7 +16,7 @@ export LINEAR_TEAM_ID=<your-team-uuid>   # required for status discovery + scope
 
 ## Subject kind
 
-This backend advertises a single subject kind: **`issue`**. Animus addresses it via the kind-scoped routing contract — `issue/list`, `issue/get`, `issue/update`. CLI calls use `--kind issue`:
+This backend advertises a single subject kind: **`issue`**. Animus addresses it via the kind-scoped routing contract — `issue/list`, `issue/get`, `issue/update`, `issue/create`. CLI calls use `--kind issue`:
 
 ```bash
 animus subject list --kind issue --status ready
@@ -54,11 +54,49 @@ workflows:
 |-------------------|------------------------------------|---------------------------------------------------------------------------------------------------------------------------------------------|
 | `subject/list`    | `issues(filter, first, after)`     | Pagination cursor returned in `next_cursor`.                                                                                                |
 | `subject/get`     | `issue(id: $identifier)`           | `id` argument is the Linear identifier (e.g. `ENG-123`) or UUID.                                                                            |
-| `subject/update`  | `issueUpdate` + `commentCreate`    | `patch.status`, `patch.assignee`, `patch.labels_add/remove`, `patch.custom` ride on `issueUpdate`. `patch.comment` posts a real Linear comment via `commentCreate` — it does **not** overwrite the issue body. |
-| `subject/schema`  | static + runtime workflow states   | `kinds: ["issue"]`; native states discovered lazily from the team's workflow.                                                               |
+| `subject/update`  | `issueUpdate` + `commentCreate`    | `patch.status`, `patch.assignee`, `patch.labels_add/remove`, `patch.custom` ride on `issueUpdate`. `patch.comment` posts a real Linear comment via `commentCreate` — it does **not** overwrite the issue body. See [Known limitations](#known-limitations) — `patch` carries no priority. |
+| `subject/create`  | `issueCreate`                      | Since v0.1.8. Flat params `{title, body?, status?, priority?, labels?}` at the **top level** (not under `patch`). Requires `LINEAR_TEAM_ID`; optional `LINEAR_PROJECT_ID` files the issue into a project. `body`→`description`, `priority` bucket (`p0`–`p3`)→Linear int, `status`→discovered `stateId`. **Labels are accepted but dropped** (not yet applied on create). Registered for both `issue/create` and `subject/create`. |
+| `subject/schema`  | static + runtime workflow states   | `kinds: ["issue"]`; `supports_create: true`; native states discovered lazily from the team's workflow.                                       |
 | `health/check`    | `viewer { id name }`               | Returns `Unhealthy` (without hitting the network) when `LINEAR_API_TOKEN` is unset.                                                          |
 
-The protocol does not yet expose a `subject/create` verb — see [`docs/architecture/subject-backend-plugins.md`](https://github.com/launchapp-dev/animus-cli/blob/main/docs/architecture/subject-backend-plugins.md) for the current contract. The schema's `supports_create` flag is reserved for the protocol expansion that adds it.
+## Known limitations
+
+### Priority can be set on create but not changed on update
+
+`issue/create` honors a `priority` bucket (`p0`–`p3`) and sets it on the new
+Linear issue, but `subject/update` **cannot change the priority of an existing
+issue** — a value passed as `animus subject update … --priority p1` never
+reaches this plugin.
+
+**Root cause (upstream, in animus-cli — not fixable in this plugin):** the
+subject protocol's `SubjectPatch` type — the payload that `subject/update`
+deserializes into — has **no `priority` field**. It models only `status`,
+`assignee`, `labels_add`, `labels_remove`, `comment`, and `custom`
+(`crates/animus-subject-protocol/src/lib.rs`). The CLI accepts `--priority` and
+places it on the wire patch, but when the daemon deserializes that JSON into
+`SubjectPatch`, the unmodeled `priority` key is silently dropped by serde. The
+plugin's `update()` therefore never receives a priority, and `build_update_input`
+has nothing to map.
+
+**To address:** add a `priority` field to `SubjectPatch` upstream in
+`animus-subject-protocol`. Once it exists, wire it through `build_update_input`
+in `src/backend.rs` (reusing `priority_bucket_to_linear`, mirroring the create
+path). No change here will help until the protocol carries the field.
+
+### Linear's priority scale is reversed relative to Animus
+
+Linear's `priority` integer runs **opposite** to Animus's `Subject.priority`
+scale (Linear `1`=Urgent … `4`=Low; Animus `0`=none … `4`=critical), so
+`linear_priority_to_animus` reverses it to keep "most urgent" aligned across
+both (P0 = highest). This is gated behind the `ANIMUS_PRIORITY_REVERSE` const in
+`src/backend.rs`; if Animus ever realigns its scale, flip that const to `false`
+and update the pinned mapping tests.
+
+### Labels are not applied on create
+
+`issue/create` accepts a `labels` array but currently logs and drops it (label
+name→id resolution is not yet implemented). `supports_create` is still advertised
+as `true`. Labels can be added afterward via `subject/update` (`labels_add`).
 
 ## Configuring status mapping
 
@@ -141,8 +179,10 @@ Per the v0.4.0 naming convention: repo, crate, and binary all share the same `an
 - [x] Authentication via `LINEAR_API_TOKEN` env var
 - [x] Pagination
 - [x] `patch.comment` posts a Linear comment via `commentCreate` (since v0.1.5; earlier versions incorrectly overwrote `description`)
+- [x] `issue/create` / `subject/create` via `issueCreate` (since v0.1.8)
 - [ ] Webhook support for real-time updates (`subject/watch`)
-- [ ] `subject/create` (waiting on protocol expansion; tracked in [animus-cli](https://github.com/launchapp-dev/animus-cli))
+- [ ] Apply labels on create (name→id resolution) — see [Known limitations](#known-limitations)
+- [ ] Honor priority on `subject/update` — **blocked upstream**: needs a `priority` field on `SubjectPatch` in `animus-subject-protocol` (see [Known limitations](#known-limitations))
 - [ ] Release binaries (macOS aarch64/x86_64, Linux x86_64)
 
 Follow the [Animus core repo](https://github.com/launchapp-dev/animus-cli) for protocol-level progress.
