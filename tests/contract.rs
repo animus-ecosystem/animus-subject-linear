@@ -103,7 +103,9 @@ async fn list_returns_mapped_subjects() {
     assert_eq!(first.id.as_str(), "linear:ENG-1");
     assert_eq!(first.title, "Investigate flaky test");
     assert_eq!(first.status, SubjectStatus::Ready);
-    assert_eq!(first.priority, Some(3));
+    // Fixture has Linear priority `3` (Normal); on the Animus 0..=4 scale that
+    // is `2` (medium) — Linear's int is reversed, not passed through.
+    assert_eq!(first.priority, Some(2));
     assert_eq!(first.assignee.as_deref(), Some("alice@example.com"));
     assert_eq!(
         first.labels,
@@ -1144,6 +1146,13 @@ async fn create_translates_full_payload() {
     let subject = backend.create(req).await.expect("create should succeed");
     assert_eq!(subject.id.as_str(), "linear:ENG-42");
     assert_eq!(subject.kind, "issue");
+    // Round-trip: the fixture echoes Linear priority `2` (High); on the Animus
+    // 0..=4 scale that is `3` (high), NOT the raw Linear int.
+    assert_eq!(
+        subject.priority,
+        Some(3),
+        "Linear High(2) must read back as Animus high(3)"
+    );
 
     let body = captured.lock().unwrap().clone().expect("server saw a body");
     let input = body.pointer("/variables/input").expect("has input");

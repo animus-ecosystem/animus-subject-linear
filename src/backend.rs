@@ -345,7 +345,7 @@ impl LinearBackend {
         let priority = issue
             .get("priority")
             .and_then(|v| v.as_u64())
-            .and_then(|n| u8::try_from(n).ok());
+            .and_then(linear_priority_to_animus);
 
         let assignee = issue
             .get("assignee")
@@ -933,6 +933,43 @@ fn priority_bucket_to_linear(bucket: &str) -> Option<i64> {
     }
 }
 
+/// Whether Linear's priority integer must be *reversed* to land on Animus's
+/// `Subject.priority` scale.
+///
+/// As of v0.1.8 the two scales run in OPPOSITE directions:
+///   * Animus `Subject.priority` (`0..=4`): 0=none, 1=low, 2=medium, 3=high,
+///     4=critical — higher number = more urgent.
+///   * Linear's `priority` int: 0=None, 1=Urgent, 2=High, 3=Normal, 4=Low —
+///     lower number (1) = more urgent.
+///
+/// So today this is `true`: Linear Urgent(1) maps to Animus critical(4), etc.,
+/// keeping "most urgent" aligned across both (P0 = highest). If Animus ever
+/// redefines its priority so the scales agree, flip this to `false` (Linear's
+/// int is then used directly) and update `linear_priority_maps_to_animus_scale`.
+const ANIMUS_PRIORITY_REVERSE: bool = true;
+
+/// Map Linear's `priority` integer to Animus's `Subject.priority` (`0..=4`),
+/// honoring [`ANIMUS_PRIORITY_REVERSE`]. Inputs outside `0..=4` return `None`
+/// so the field is left unset rather than carrying a nonsense value.
+fn linear_priority_to_animus(linear: u64) -> Option<u8> {
+    let animus = if ANIMUS_PRIORITY_REVERSE {
+        match linear {
+            0 => 0, // None   -> none
+            1 => 4, // Urgent -> critical
+            2 => 3, // High   -> high
+            3 => 2, // Normal -> medium
+            4 => 1, // Low    -> low
+            _ => return None,
+        }
+    } else {
+        match linear {
+            0..=4 => linear as u8,
+            _ => return None,
+        }
+    };
+    Some(animus)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -944,5 +981,17 @@ mod tests {
         assert_eq!(priority_bucket_to_linear("p2"), Some(3));
         assert_eq!(priority_bucket_to_linear("p3"), Some(4));
         assert_eq!(priority_bucket_to_linear("urgent"), None);
+    }
+
+    #[test]
+    fn linear_priority_maps_to_animus_scale() {
+        // Pins the behavior under the current `ANIMUS_PRIORITY_REVERSE` value.
+        // If that const is ever flipped, update these expectations to match.
+        assert_eq!(linear_priority_to_animus(0), Some(0)); // None   -> none
+        assert_eq!(linear_priority_to_animus(1), Some(4)); // Urgent -> critical
+        assert_eq!(linear_priority_to_animus(2), Some(3)); // High   -> high
+        assert_eq!(linear_priority_to_animus(3), Some(2)); // Normal -> medium
+        assert_eq!(linear_priority_to_animus(4), Some(1)); // Low    -> low
+        assert_eq!(linear_priority_to_animus(5), None); // out of range
     }
 }
