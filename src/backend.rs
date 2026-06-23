@@ -342,9 +342,13 @@ impl LinearBackend {
             .or_else(|| status_map.linear_name_to_animus(state_name))
             .unwrap_or_else(|| status_map::type_to_animus(state_type));
 
+        // `Issue.priority` is GraphQL `Float!`. Linear emits whole numbers
+        // today (`2`), but a `Float` may legitimately arrive as `2.0`, for
+        // which `.as_u64()` returns `None`. Fall back to `.as_f64()` so the
+        // priority survives either encoding.
         let priority = issue
             .get("priority")
-            .and_then(|v| v.as_u64())
+            .and_then(|v| v.as_u64().or_else(|| v.as_f64().map(|f| f.round() as u64)))
             .and_then(linear_priority_to_animus);
 
         let assignee = issue
@@ -981,6 +985,29 @@ mod tests {
         assert_eq!(priority_bucket_to_linear("p2"), Some(3));
         assert_eq!(priority_bucket_to_linear("p3"), Some(4));
         assert_eq!(priority_bucket_to_linear("urgent"), None);
+    }
+
+    #[test]
+    fn priority_is_read_robustly_when_wire_value_is_a_float() {
+        // Linear's `Issue.priority` is GraphQL `Float!`. A JSON encoder is
+        // free to serialize a whole-number float as `2.0`, and serde_json's
+        // `.as_u64()` returns `None` for that — which would silently drop the
+        // priority. The extraction must tolerate both `2` and `2.0`.
+        let issue = serde_json::json!({
+            "identifier": "ENG-1",
+            "title": "t",
+            "priority": 2.0,
+            "state": { "id": "s", "name": "Todo", "type": "unstarted" },
+            "createdAt": "2024-01-01T00:00:00Z",
+            "updatedAt": "2024-01-01T00:00:00Z",
+        });
+        let map = StatusMap::default();
+        let subject = LinearBackend::issue_to_subject(&issue, &map).expect("maps");
+        assert_eq!(
+            subject.priority,
+            Some(3),
+            "Linear High(2) must read back as Animus high(3) even when the wire value is a float"
+        );
     }
 
     #[test]

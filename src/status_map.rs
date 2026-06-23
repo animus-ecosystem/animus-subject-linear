@@ -165,10 +165,11 @@ impl StatusMap {
 /// Map a Linear `WorkflowState.type` literal to a [`SubjectStatus`].
 ///
 /// Linear's documented set is `triage`, `backlog`, `unstarted`, `started`,
-/// `completed`, `cancelled` (note the British spelling on the wire — Linear's
-/// SDL uses `cancelled`). Anything else falls back to [`SubjectStatus::Ready`]
-/// so workflows don't grind to a halt on a future Linear-side addition we
-/// haven't seen yet.
+/// `completed`, `canceled` (Linear's SDL uses the American spelling
+/// `canceled` — single `l`). We match both spellings defensively in case
+/// Linear ever changes it. Anything else falls back to
+/// [`SubjectStatus::Ready`] so workflows don't grind to a halt on a future
+/// Linear-side addition we haven't seen yet.
 pub fn type_to_animus(state_type: &str) -> SubjectStatus {
     match state_type {
         "triage" | "backlog" | "unstarted" => SubjectStatus::Ready,
