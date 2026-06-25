@@ -293,6 +293,17 @@ impl LinearBackend {
             );
         }
 
+        // Scope list results to the configured project, when one is set. This
+        // mirrors create (which assigns issues to `project_id`) so that list and
+        // create operate on the same project. Backward compatible: with no
+        // project_id configured, no project filter is applied (whole-team list).
+        if let Some(project_id) = self.client.project_id() {
+            graphql_filter.insert(
+                "project".to_string(),
+                json!({ "id": { "eq": project_id } }),
+            );
+        }
+
         Value::Object(graphql_filter)
     }
 
